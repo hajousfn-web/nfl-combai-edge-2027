@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import unittest
 
 import numpy as np
@@ -17,6 +18,7 @@ SUMMARY_COLUMNS = (
     "average_proprietary_cut_efficiency",
     "total_sharp_cuts",
 )
+OPTIONAL_SUMMARY_COLUMNS = ("draft_year",)
 SAMPLE_RATE_HZ = 10.0
 SHARP_CUT_THRESHOLD_DEGREES = 45.0
 
@@ -55,7 +57,11 @@ def calculate_deceleration_efficiency(tracking_df: pd.DataFrame) -> pd.DataFrame
         raise ValueError("tracking_df must not contain duplicate column names.")
 
     # Keep only the inputs needed for these features to limit working memory.
-    tracks = tracking_df.loc[:, REQUIRED_COLUMNS].copy()
+    included_columns = [
+        *REQUIRED_COLUMNS,
+        *[column for column in OPTIONAL_SUMMARY_COLUMNS if column in tracking_df.columns],
+    ]
+    tracks = tracking_df.loc[:, included_columns].copy()
     if tracks.loc[:, TRACK_KEYS].isna().any().any():
         raise ValueError("game_id, play_id, and player_id must not be missing.")
 
@@ -66,6 +72,19 @@ def calculate_deceleration_efficiency(tracking_df: pd.DataFrame) -> pd.DataFrame
             raise ValueError(f"{column} must contain numeric values.") from error
         if not np.isfinite(tracks[column].to_numpy(dtype=float)).all():
             raise ValueError(f"{column} must contain only finite values.")
+
+    if "draft_year" in tracks.columns:
+        try:
+            tracks["draft_year"] = pd.to_numeric(tracks["draft_year"], errors="raise")
+        except (TypeError, ValueError) as error:
+            raise ValueError("draft_year must contain numeric years.") from error
+        if not np.isfinite(tracks["draft_year"].to_numpy(dtype=float)).all():
+            raise ValueError("draft_year must contain only finite years.")
+        if not tracks["draft_year"].mod(1).eq(0).all():
+            raise ValueError("draft_year must contain whole-number years.")
+        year_counts = tracks.groupby("player_id", observed=True)["draft_year"].nunique()
+        if year_counts.gt(1).any():
+            raise ValueError("draft_year must be consistent for each player_id.")
 
     if not tracks["frame_id"].mod(1).eq(0).all():
         raise ValueError("frame_id must contain whole-number frame indices.")
@@ -95,13 +114,14 @@ def calculate_deceleration_efficiency(tracking_df: pd.DataFrame) -> pd.DataFrame
 
     previous_dx = groups["_dx"].shift()
     previous_dy = groups["_dy"].shift()
-    previous_distance = np.hypot(previous_dx, previous_dy)
-    current_distance = np.hypot(tracks["_dx"], tracks["_dy"])
+    previous_distance = (previous_dx.pow(2) + previous_dy.pow(2)).pow(0.5)
+    current_distance = (tracks["_dx"].pow(2) + tracks["_dy"].pow(2)).pow(0.5)
     valid_turn = previous_distance.gt(0) & current_distance.gt(0)
     cosine = (
         (previous_dx * tracks["_dx"] + previous_dy * tracks["_dy"])
-        / (previous_distance * current_distance)
-    ).where(valid_turn)
+        .div(previous_distance * current_distance)
+        .where(valid_turn)
+    )
     tracks["_direction_change"] = np.degrees(
         np.arccos(cosine.clip(lower=-1, upper=1))
     )
@@ -113,16 +133,31 @@ def calculate_deceleration_efficiency(tracking_df: pd.DataFrame) -> pd.DataFrame
     ).where(tracks["_is_sharp_cut"] & previous_speed.gt(0))
 
     if tracks.empty:
-        return pd.DataFrame(columns=SUMMARY_COLUMNS)
+        summary_columns: list[str] = list(SUMMARY_COLUMNS)
+        if "draft_year" in tracks.columns:
+            summary_columns.insert(1, "draft_year")
+        return pd.DataFrame(columns=summary_columns)
+
+    aggregations: dict[str, tuple[str, str]] = {
+        "average_deceleration": ("_deceleration", "mean"),
+        "max_speed": ("_speed", "max"),
+        "average_proprietary_cut_efficiency": (
+            "proprietary_cut_efficiency",
+            "mean",
+        ),
+        "total_sharp_cuts": ("_is_sharp_cut", "sum"),
+    }
+    if "draft_year" in tracks.columns:
+        aggregations["draft_year"] = ("draft_year", "first")
 
     summary = tracks.groupby("player_id", sort=True, observed=True).agg(
-        average_deceleration=("_deceleration", "mean"),
-        max_speed=("_speed", "max"),
-        average_proprietary_cut_efficiency=("proprietary_cut_efficiency", "mean"),
-        total_sharp_cuts=("_is_sharp_cut", "sum"),
+        **aggregations,
     )
     summary["total_sharp_cuts"] = summary["total_sharp_cuts"].astype("int64")
-    return summary.reset_index()[list(SUMMARY_COLUMNS)]
+    summary_columns: list[str] = list(SUMMARY_COLUMNS)
+    if "draft_year" in tracks.columns:
+        summary_columns.insert(1, "draft_year")
+    return summary.reset_index()[summary_columns]
 
 
 class _FeatureEngineeringTest(unittest.TestCase):
@@ -144,16 +179,21 @@ class _FeatureEngineeringTest(unittest.TestCase):
 
         result = calculate_deceleration_efficiency(tracking).set_index("player_id")
 
-        self.assertEqual(result.loc[10, "total_sharp_cuts"], 1)
-        self.assertAlmostEqual(
-            result.loc[10, "average_proprietary_cut_efficiency"], 1.0
-        )
-        self.assertAlmostEqual(result.loc[10, "max_speed"], 20.0)
-        self.assertEqual(result.loc[20, "total_sharp_cuts"], 0)
+        sharp_cuts = result["total_sharp_cuts"].to_numpy(dtype=np.int64)
+        cut_efficiency = result[
+            "average_proprietary_cut_efficiency"
+        ].to_numpy(dtype=np.float64)
+        max_speed = result["max_speed"].to_numpy(dtype=np.float64)
+        deceleration = result["average_deceleration"].to_numpy(dtype=np.float64)
+
+        self.assertEqual(sharp_cuts[0], 1)
+        self.assertAlmostEqual(cut_efficiency[0], 1.0)
+        self.assertAlmostEqual(max_speed[0], 20.0)
+        self.assertEqual(sharp_cuts[1], 0)
         self.assertTrue(
-            np.isnan(result.loc[20, "average_proprietary_cut_efficiency"])
+            np.isnan(cut_efficiency[1])
         )
-        self.assertAlmostEqual(result.loc[20, "average_deceleration"], 100.0)
+        self.assertAlmostEqual(deceleration[1], 100.0)
 
     def test_empty_input_returns_summary_columns(self) -> None:
         empty = pd.DataFrame(columns=REQUIRED_COLUMNS)
@@ -162,6 +202,42 @@ class _FeatureEngineeringTest(unittest.TestCase):
         self.assertEqual(list(result.columns), list(SUMMARY_COLUMNS))
         self.assertTrue(result.empty)
 
+    def test_preserves_draft_year_for_cohort_integration(self) -> None:
+        tracking = pd.DataFrame(
+            [
+                (1, 7, 10, 1, 0, 0, 2024),
+                (1, 7, 10, 2, 1, 0, 2024),
+            ],
+            columns=(*REQUIRED_COLUMNS, "draft_year"),
+        )
+
+        result = calculate_deceleration_efficiency(tracking)
+
+        self.assertIn("draft_year", result.columns)
+        self.assertEqual(
+            result["draft_year"].to_numpy(dtype=np.int64)[0],
+            2024,
+        )
+
+
+def main() -> int:
+    """Run the mock-data feature checks without loading any tracking dataset."""
+    parser = argparse.ArgumentParser(
+        description="Validate the tracking feature calculations locally."
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run mock-data tests without loading competition data.",
+    )
+    args = parser.parse_args()
+    if not args.self_test:
+        parser.error("use --self-test to run the local validation suite")
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(_FeatureEngineeringTest)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(main())

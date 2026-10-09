@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -25,6 +28,7 @@ CUT_EFFICIENCY_CANDIDATES = (
 )
 RIDGE_ALPHA = 1.0
 OUTPUT_FILENAME = "model_integration_insights.csv"
+ROOKIE_DRAFT_YEARS = (2023, 2024, 2025)
 
 
 def _normalized_name(name: Any) -> str:
@@ -47,6 +51,17 @@ def _is_target_metric(column: Any) -> bool:
         or "yardsaftercatch" in normalized
         or "defensivestop" in normalized
         or normalized == "stops"
+        or normalized == "epa"
+        or "expectedpointsadded" in normalized
+    )
+
+
+def _is_context_column(column: Any) -> bool:
+    normalized = _normalized_name(column)
+    return (
+        normalized in {"season", "draftyear", "rookieyear", "week", "gameid", "playid"}
+        or normalized.endswith("playerid")
+        or normalized.endswith("nflid")
     )
 
 
@@ -115,28 +130,32 @@ def _save_insights(insights: pd.DataFrame) -> Path:
 def integrate_combine_with_season_performance(
     player_summary_df: pd.DataFrame,
     regular_season_df: pd.DataFrame,
+    games_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Left-join player tracking summaries to season metrics and assess signal.
 
-    Player IDs are matched using ``nflId`` when available, otherwise a
-    ``playerId``, ``player_identifier``, or ``player`` column. The two inputs
-    may use different names for the same key. Repeated season rows are
-    collapsed to player-season level (sum recognized outcome metrics, mean
-    other numeric fields, and first non-numeric values) before the left merge,
-    preventing an accidental many-to-many memory expansion.
+    The input summary must contain ``draft_year`` and is restricted to the
+    2023–2025 rookie cohorts. Player IDs are matched using ``nflId`` when
+    available, otherwise a ``playerId``, ``player_identifier``, or ``player``
+    column. Performance rows must contain ``season``; for player_play-style
+    rows without it, provide ``games_df`` with ``game_id`` and ``season`` so
+    game seasons can be attached before filtering. Only each player's
+    draft-year (rookie) season is retained. Repeated game rows are collapsed
+    per player after this filter, preventing many-to-many expansion.
 
     Missing cut-efficiency values are imputed with the observed median. Missing
     outcomes are excluded from that metric's pairwise analysis. The function
     computes Pearson correlations and a standardized univariate Ridge baseline
-    (alpha=1; in-sample R²) for numeric season outcomes. Known YAC/defensive-stop
-    outcomes are preferred; if none are present, all numeric season metrics are
-    analyzed. Aggregate-only insights are written atomically to
+    (alpha=1; in-sample R²) for numeric season outcomes, including YAC, EPA,
+    and defensive stops. Aggregate-only insights are written atomically to
     ``outputs/model_integration_insights.csv``; player-level records are not
     written to disk.
 
     Args:
         player_summary_df: One-row-per-player combine/tracking summary.
-        regular_season_df: Player-level or repeated game-level season metrics.
+        regular_season_df: Player-level or repeated game-level performance.
+        games_df: Optional games table used to attach ``season`` to performance
+            rows by ``game_id`` when that column is absent.
 
     Returns:
         The merged player-level DataFrame, retaining combine-summary rows with
@@ -144,16 +163,20 @@ def integrate_combine_with_season_performance(
 
     Raises:
         TypeError: If either argument is not a pandas DataFrame.
-        ValueError: If IDs or cut-efficiency features are missing/ambiguous, or
-            combine summaries are not unique by player.
+        ValueError: If identifiers, cohort/season fields, or cut-efficiency
+            features are missing/ambiguous, or combine summaries are not unique.
         OSError: If the insights CSV cannot be written.
     """
     if not isinstance(player_summary_df, pd.DataFrame):
         raise TypeError("player_summary_df must be a pandas DataFrame.")
     if not isinstance(regular_season_df, pd.DataFrame):
         raise TypeError("regular_season_df must be a pandas DataFrame.")
+    if games_df is not None and not isinstance(games_df, pd.DataFrame):
+        raise TypeError("games_df must be a pandas DataFrame when provided.")
     if not player_summary_df.columns.is_unique or not regular_season_df.columns.is_unique:
         raise ValueError("Input DataFrames must not contain duplicate column names.")
+    if games_df is not None and not games_df.columns.is_unique:
+        raise ValueError("games_df must not contain duplicate column names.")
 
     summary_key = _find_column(player_summary_df, PLAYER_KEY_CANDIDATES)
     season_key = _find_column(regular_season_df, PLAYER_KEY_CANDIDATES)
@@ -161,6 +184,11 @@ def integrate_combine_with_season_performance(
         raise ValueError(
             "Both inputs require a player identifier (nflId preferred, then "
             "playerId, player_identifier, or player)."
+        )
+    draft_year_column = _find_column(player_summary_df, ("draft_year",))
+    if draft_year_column is None:
+        raise ValueError(
+            "player_summary_df must contain draft_year to select the 2023–2025 rookie cohorts."
         )
 
     feature_column = _find_column(player_summary_df, CUT_EFFICIENCY_CANDIDATES)
@@ -179,11 +207,12 @@ def integrate_combine_with_season_performance(
             "player_summary_df contains multiple cut-efficiency feature columns."
         )
 
-    # Only known outcome columns or numeric season metrics enter the analysis.
+    # Restrict analysis to numeric performance values, never IDs, season labels,
+    # or other context fields.
     numeric_season_columns = [
         column
         for column in regular_season_df.select_dtypes(include="number").columns
-        if column != season_key
+        if column != season_key and not _is_context_column(column)
     ]
     known_outcomes = [
         column for column in numeric_season_columns if _is_target_metric(column)
@@ -195,7 +224,14 @@ def integrate_combine_with_season_performance(
             "as yards after catch or defensive stops."
         )
 
-    summary = player_summary_df.copy()
+    summary_columns = list(dict.fromkeys([*player_summary_df.columns, draft_year_column]))
+    summary = player_summary_df.loc[:, summary_columns].copy()
+    summary[draft_year_column] = pd.to_numeric(
+        summary[draft_year_column], errors="coerce"
+    )
+    summary = summary.loc[
+        summary[draft_year_column].isin(ROOKIE_DRAFT_YEARS)
+    ].copy()
     if feature_column != "proprietary_cut_efficiency":
         summary.rename(
             columns={feature_column: "proprietary_cut_efficiency"},
@@ -212,11 +248,79 @@ def integrate_combine_with_season_performance(
             "a many-to-many merge."
         )
 
-    # Work with one-season-row-per-player and avoid constructing game-level
-    # many-to-many joins in memory.
-    season = regular_season_df.copy()
+    season_column = _find_column(regular_season_df, ("season",))
+    game_id_column = _find_column(regular_season_df, ("game_id",))
+    season_columns = list(dict.fromkeys([season_key, *outcome_columns]))
+    if season_column is not None:
+        season_columns.append(season_column)
+    elif games_df is not None:
+        games_game_id = _find_column(games_df, ("game_id",))
+        games_season = _find_column(games_df, ("season",))
+        if game_id_column is None or games_game_id is None or games_season is None:
+            raise ValueError(
+                "To attach seasons, regular_season_df and games_df must both "
+                "contain game_id, and games_df must contain season."
+            )
+        season_columns.append(game_id_column)
+    else:
+        raise ValueError(
+            "regular_season_df must contain season, or pass games_df with "
+            "game_id and season columns."
+        )
+
+    # Keep only join keys, cohort fields, and outcomes before joining so
+    # unrelated tracking/game columns cannot multiply memory use.
+    season = regular_season_df.loc[:, list(dict.fromkeys(season_columns))].copy()
     season["_integration_player_key"] = _safe_player_key(season[season_key])
     season = season.loc[season["_integration_player_key"].notna()].copy()
+
+    if season_column is None:
+        if games_df is None or game_id_column is None:
+            raise ValueError(
+                "games_df and game_id are required to attach game-season values."
+            )
+        games_game_id = _find_column(games_df, ("game_id",))
+        games_season = _find_column(games_df, ("season",))
+        if games_game_id is None or games_season is None:
+            raise ValueError("games_df must contain game_id and season columns.")
+        games = games_df.loc[:, [games_game_id, games_season]].copy()
+        games["_integration_game_key"] = _safe_player_key(games[games_game_id])
+        games[games_season] = pd.to_numeric(games[games_season], errors="coerce")
+        games = games.loc[
+            games["_integration_game_key"].notna()
+            & games[games_season].notna(),
+            ["_integration_game_key", games_season],
+        ]
+        if games["_integration_game_key"].duplicated().any():
+            raise ValueError("games_df must contain one season row per game_id.")
+        season["_integration_game_key"] = _safe_player_key(season[game_id_column])
+        season = season.merge(
+            games,
+            how="inner",
+            on="_integration_game_key",
+            validate="many_to_one",
+            sort=False,
+        )
+        season.drop(columns="_integration_game_key", inplace=True)
+        season_column = games_season
+
+    season[season_column] = pd.to_numeric(season[season_column], errors="coerce")
+    cohort = summary.loc[
+        :, ["_integration_player_key", draft_year_column]
+    ].rename(columns={draft_year_column: "_integration_draft_year"})
+    season = season.merge(
+        cohort,
+        how="inner",
+        on="_integration_player_key",
+        validate="many_to_one",
+        sort=False,
+    )
+    season = season.loc[
+        season[season_column].eq(season["_integration_draft_year"])
+    ].drop(columns="_integration_draft_year")
+    season = season.loc[
+        :, ["_integration_player_key", *outcome_columns]
+    ]
     season = _aggregate_season_rows(
         season, "_integration_player_key", outcome_columns
     )
@@ -341,6 +445,9 @@ def integrate_combine_with_season_performance(
     output_path = _save_insights(insights)
 
     print("Combine tracking vs. regular-season performance")
+    print(
+        f"Cohort: draft_year in {ROOKIE_DRAFT_YEARS}; rookie season equals draft_year"
+    )
     print(f"Merge: left join on {summary_key} = {season_key}")
     print(f"Players retained: {len(merged):,}")
     print(f"Cut-efficiency values imputed: {imputed_count:,}")
@@ -355,8 +462,11 @@ def integrate_combine_with_season_performance(
 
 class _ModelIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.output_path = Path(__file__).resolve().parent.parent / "outputs" / OUTPUT_FILENAME
-        self.output_path.unlink(missing_ok=True)
+        self.output_path = (
+            Path(__file__).resolve().parent.parent
+            / "outputs"
+            / f".model-integration-test-{uuid4().hex}.csv"
+        )
 
     def tearDown(self) -> None:
         self.output_path.unlink(missing_ok=True)
@@ -365,20 +475,23 @@ class _ModelIntegrationTest(unittest.TestCase):
         summary = pd.DataFrame(
             {
                 "player_id": [101, 102, 103, 104],
+                "draft_year": [2023, 2024, 2025, 2024],
                 "average_proprietary_cut_efficiency": [0.5, np.nan, 1.5, 0.75],
                 "max_speed": [18.0, 20.0, 22.0, 19.0],
             }
         )
         season = pd.DataFrame(
             {
-                "nflId": [101, 101, 102, 103],
-                "yards_after_catch": [4.0, 6.0, 12.0, 20.0],
-                "defensive_stops": [1.0, 2.0, 4.0, 5.0],
-                "proprietary_cut_efficiency": [0.8, 0.9, 0.7, 0.6],
+                "nflId": [101, 101, 101, 102, 103],
+                "yards_after_catch": [4.0, 6.0, 100.0, 12.0, 20.0],
+                "defensive_stops": [1.0, 2.0, 100.0, 4.0, 5.0],
+                "proprietary_cut_efficiency": [0.8, 0.9, 0.1, 0.7, 0.6],
+                "season": [2023, 2023, 2024, 2024, 2025],
             }
         )
 
-        merged = integrate_combine_with_season_performance(summary, season)
+        with patch(f"{__name__}.OUTPUT_FILENAME", self.output_path.name):
+            merged = integrate_combine_with_season_performance(summary, season)
 
         self.assertEqual(len(merged), 4)
         self.assertEqual(merged["proprietary_cut_efficiency"].isna().sum(), 0)
@@ -396,13 +509,63 @@ class _ModelIntegrationTest(unittest.TestCase):
         self.assertEqual(set(saved["outcome_metric"]), {"yards_after_catch", "defensive_stops"})
         self.assertTrue(saved["pearson_correlation"].notna().all())
 
+    def test_joins_games_to_player_play_before_rookie_season_filter(self) -> None:
+        summary = pd.DataFrame(
+            {
+                "nflId": [201],
+                "draft_year": [2024],
+                "proprietary_cut_efficiency": [0.8],
+            }
+        )
+        player_play = pd.DataFrame(
+            {
+                "nflId": [201, 201],
+                "game_id": [1, 2],
+                "yards_after_catch": [7.0, 70.0],
+                "epa": [1.0, 10.0],
+            }
+        )
+        games = pd.DataFrame({"game_id": [1, 2], "season": [2024, 2025]})
+
+        with patch(f"{__name__}.OUTPUT_FILENAME", self.output_path.name):
+            merged = integrate_combine_with_season_performance(
+                summary, player_play, games_df=games
+            )
+
+        self.assertEqual(merged.loc[0, "yards_after_catch"], 7.0)
+        self.assertEqual(merged.loc[0, "epa"], 1.0)
+
+    def test_epa_is_a_supported_target_metric(self) -> None:
+        self.assertTrue(_is_target_metric("epa"))
+        self.assertTrue(_is_target_metric("expected_points_added"))
+
     def test_requires_player_identifiers(self) -> None:
         with self.assertRaisesRegex(ValueError, "player identifier"):
-            integrate_combine_with_season_performance(
-                pd.DataFrame({"proprietary_cut_efficiency": [1.0]}),
-                pd.DataFrame({"yards_after_catch": [3.0]}),
-            )
+            with patch(f"{__name__}.OUTPUT_FILENAME", self.output_path.name):
+                integrate_combine_with_season_performance(
+                    pd.DataFrame({"proprietary_cut_efficiency": [1.0]}),
+                    pd.DataFrame({"yards_after_catch": [3.0]}),
+                )
+
+
+def main() -> int:
+    """Run mock-data validation without reading competition datasets."""
+    parser = argparse.ArgumentParser(
+        description="Validate player-level combine/season integration."
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run mock-data tests without loading competition data.",
+    )
+    args = parser.parse_args()
+    if not args.self_test:
+        parser.error("use --self-test to run the local validation suite")
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(_ModelIntegrationTest)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(main())
