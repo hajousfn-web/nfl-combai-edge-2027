@@ -1,5 +1,8 @@
 """Stream tracking CSV data and derive per-observation movement metrics."""
 
+# Author: Soufiane Hajou
+# VisiShield-Edge(TM) | Copyright (c) 2026 Soufiane Hajou. All Rights Reserved.
+
 from __future__ import annotations
 
 import argparse
@@ -373,9 +376,18 @@ def process_tracking(input_file: TextIO, output_file: IO[str]) -> int:
             if entity_type != "PLAYER":
                 continue
         try:
-            track = tuple(
-                row[column].strip()
-                for column in ("game_id", "play_id", player_field)
+            raw_game_id = row["game_id"]
+            raw_play_id = row["play_id"]
+            raw_player_id = row[player_field]
+            if not all(
+                isinstance(value, str)
+                for value in (raw_game_id, raw_play_id, raw_player_id)
+            ):
+                raise ValueError("game_id, play_id, and player identifier must be strings")
+            track: tuple[str, str, str] = (
+                raw_game_id.strip(),
+                raw_play_id.strip(),
+                raw_player_id.strip(),
             )
             frame = int(row["frame_id"])
             x = float(row["x"])

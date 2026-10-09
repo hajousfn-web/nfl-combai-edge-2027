@@ -4,6 +4,9 @@ Thresholds must come from an explicit, reviewed local configuration. This
 module is a reference simulator, not a certified safety kernel or controller.
 """
 
+# Author: Soufiane Hajou
+# VisiShield-Edge(TM) | Copyright (c) 2026 Soufiane Hajou. All Rights Reserved.
+
 from __future__ import annotations
 
 from datetime import datetime, timezone

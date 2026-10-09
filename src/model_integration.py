@@ -1,5 +1,8 @@
 """Join combine tracking features to regular-season metrics and assess signal."""
 
+# Author: Soufiane Hajou
+# VisiShield-Edge(TM) | Copyright (c) 2026 Soufiane Hajou. All Rights Reserved.
+
 from __future__ import annotations
 
 import argparse
@@ -542,20 +545,17 @@ def integrate_combine_with_season_performance(
         ridge_r2 = float("nan")
 
         if n_observations >= 2:
-            correlation_matrix = paired.corr(method="pearson", min_periods=2)
-            correlation = float(
-                correlation_matrix.loc["feature", "outcome"]
-            )
-            feature_std = float(paired["feature"].std(ddof=0))
-            outcome_std = float(paired["outcome"].std(ddof=0))
+            feature_values = paired["feature"].to_numpy(dtype=np.float64)
+            outcome_values = paired["outcome"].to_numpy(dtype=np.float64)
+            feature_std = float(np.std(feature_values))
+            outcome_std = float(np.std(outcome_values))
             if feature_std > 0 and outcome_std > 0:
+                correlation = float(np.corrcoef(feature_values, outcome_values)[0, 1])
                 standardized_x = (
-                    paired["feature"].to_numpy(dtype=float)
-                    - float(paired["feature"].mean())
+                    feature_values - float(np.mean(feature_values))
                 ) / feature_std
                 standardized_y = (
-                    paired["outcome"].to_numpy(dtype=float)
-                    - float(paired["outcome"].mean())
+                    outcome_values - float(np.mean(outcome_values))
                 ) / outcome_std
                 ridge_coefficient = float(
                     np.dot(standardized_x, standardized_y)

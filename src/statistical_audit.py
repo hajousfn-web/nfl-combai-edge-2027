@@ -1,5 +1,8 @@
 """Strict linkage, partial-rank inference, and draft-class validation helpers."""
 
+# Author: Soufiane Hajou
+# VisiShield-Edge(TM) | Copyright (c) 2026 Soufiane Hajou. All Rights Reserved.
+
 from __future__ import annotations
 
 from dataclasses import dataclass

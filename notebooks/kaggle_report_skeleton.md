@@ -7,6 +7,11 @@
 > results before publishing the Kaggle report. Keep raw data local to its
 > authorized environment; do not download full datasets just to populate this
 > skeleton.
+>
+> **Ownership:** Original VisiShield-Edge(TM) project code and report materials
+> are proprietary to Soufiane Hajou under the repository root LICENSE. Check
+> competition and Kaggle terms before publishing or redistributing any
+> submission material; those terms and third-party/data rights still apply.
 
 ## Contents
 

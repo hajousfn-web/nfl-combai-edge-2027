@@ -5,6 +5,9 @@ policy. It records state transitions only; it does not control actuators or
 define operational hazard thresholds.
 """
 
+# Author: Soufiane Hajou
+# VisiShield-Edge(TM) | Copyright (c) 2026 Soufiane Hajou. All Rights Reserved.
+
 from __future__ import annotations
 
 from collections import deque

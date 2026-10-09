@@ -1,5 +1,8 @@
 """Create publication-ready, non-interactive NFL tracking visualizations."""
 
+# Author: Soufiane Hajou
+# VisiShield-Edge(TM) | Copyright (c) 2026 Soufiane Hajou. All Rights Reserved.
+
 from __future__ import annotations
 
 import argparse

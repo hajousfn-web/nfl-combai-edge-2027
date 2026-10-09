@@ -1,5 +1,8 @@
 """Kinematic features for NFL 10 Hz player-tracking data."""
 
+# Author: Soufiane Hajou
+# VisiShield-Edge(TM) | Copyright (c) 2026 Soufiane Hajou. All Rights Reserved.
+
 from __future__ import annotations
 
 import argparse

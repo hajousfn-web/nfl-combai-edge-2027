@@ -1,5 +1,13 @@
 # NFL CombAI Edge: Uncovering Non-Intuitive Tracking Metrics
 
+## License and ownership
+
+Unless otherwise identified, this repository's original source code and
+documentation are proprietary to Soufiane Hajou and reserved under the root
+[LICENSE](LICENSE). Third-party dependencies, competition data, and materials
+submitted to an external competition remain subject to their owners' licenses
+and platform terms.
+
 An analytics project for the NFL Big Data Bowl 2027 competition. We aim to find
 tracking patterns that are informative but easy to miss with conventional
 box-score and aggregate metrics.

@@ -4,6 +4,9 @@ Python object allocation, interpreter scheduling, and garbage collection remain
 present. This is not a hard-real-time or zero-allocation execution guarantee.
 """
 
+# Author: Soufiane Hajou
+# VisiShield-Edge(TM) | Copyright (c) 2026 Soufiane Hajou. All Rights Reserved.
+
 from __future__ import annotations
 
 from array import array

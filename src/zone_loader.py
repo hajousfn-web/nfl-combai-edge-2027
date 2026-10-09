@@ -4,6 +4,9 @@ This module validates configuration shape only. It does not approve distances
 for a real venue, sensor, sport, or safety function.
 """
 
+# Author: Soufiane Hajou
+# VisiShield-Edge(TM) | Copyright (c) 2026 Soufiane Hajou. All Rights Reserved.
+
 from __future__ import annotations
 
 import json
