@@ -185,17 +185,25 @@ cross-validated prediction establishes causality.
 
 ## 5. Visualizations & Strategic Conclusion
 
-`src/visualization.py` uses Matplotlib's non-interactive Agg backend. It reads
-CSV files only from `outputs/`, samples at most 10,000 valid rows, and saves a
-PNG there. It supports player-level plots for recognized performance fields
-such as YAC or defensive stops and a scatter plot of aggregate Pearson
-correlation against the Ridge coefficient. EPA can be plotted from player-level
-data by specifying `--y-column epa` when that column exists.
+`src/visualization.py` uses Matplotlib's non-interactive Agg backend and a
+color-blind-friendly palette. `generate_project_visualizations()` can plot
+raw/precomputed 10 Hz velocity and sharp-cut speed retention, and can compare
+paired out-of-sample actual/predicted EPA and YAC. Prediction comparison files
+must supply actual and predicted values. Per-player vertical bounds are shown
+only when lower and upper prediction-bound columns are both present; a
+paired-bootstrap 95% confidence interval for mean prediction error is also
+reported. No individual prediction intervals are fabricated.
+
+The current modeling entry point saves aggregate cross-validation metrics, not
+player-level predictions. Therefore, prediction comparison plots require
+separately retained out-of-fold predictions from a reviewed evaluation run.
+The legacy scatter utility remains available for efficiency/performance CSVs
+and the aggregate correlation-vs-Ridge-coefficient plot.
 
 Example after producing an authorized, prepared player-level file:
 
 ```bash
-python src/visualization.py outputs/rookie_season_metrics.csv --y-column epa
+python -c "from src.visualization import generate_project_visualizations; generate_project_visualizations('outputs/tracking_features.csv', 'outputs/model_predictions.csv')"
 ```
 
 **Figures to include:**

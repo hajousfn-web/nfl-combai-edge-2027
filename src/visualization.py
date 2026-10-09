@@ -1,4 +1,4 @@
-"""Create compact, non-interactive plots from local output CSV files."""
+"""Create publication-ready, non-interactive NFL tracking visualizations."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Literal
+from unittest.mock import patch
 
 import matplotlib
 
@@ -18,11 +19,25 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 
 MAX_PLOT_POINTS = 10_000
 CHUNK_SIZE = 50_000
-PNG_DPI = 120
+MAX_INPUT_ROWS = 250_000
+PNG_DPI = 180
+PALETTE = {
+    "blue": "#0072B2",
+    "orange": "#D55E00",
+    "green": "#009E73",
+    "purple": "#CC79A7",
+    "sky": "#56B4E9",
+    "yellow": "#E69F00",
+    "dark": "#263238",
+    "muted": "#66757F",
+    "grid": "#D9E1E5",
+}
 EFFICIENCY_COLUMNS = (
     "proprietary_cut_efficiency",
     "average_proprietary_cut_efficiency",
@@ -41,6 +56,26 @@ INSIGHT_COLUMNS = (
     "pearson_correlation",
     "ridge_standardized_coefficient",
 )
+PREDICTION_COLUMN_CANDIDATES = {
+    "epa": ("predicted_epa", "epa_prediction", "epa_pred"),
+    "yards_after_catch": (
+        "predicted_yac",
+        "predicted_yards_after_catch",
+        "yards_after_catch_prediction",
+        "yac_prediction",
+        "yac_pred",
+    ),
+}
+ACTUAL_COLUMN_CANDIDATES = {
+    "epa": ("actual_epa", "epa_actual", "epa"),
+    "yards_after_catch": (
+        "actual_yards_after_catch",
+        "yards_after_catch_actual",
+        "actual_yac",
+        "yards_after_catch",
+        "yac",
+    ),
+}
 
 PlotMode = Literal["player", "insights"]
 
@@ -77,6 +112,79 @@ def _match_column(columns: list[str], candidates: tuple[str, ...]) -> str | None
         if match is not None:
             return match
     return None
+
+
+def _apply_publication_style(axis: Axes) -> None:
+    """Apply restrained spines, labels, and grid styling to one axes."""
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.spines["left"].set_color(PALETTE["muted"])
+    axis.spines["bottom"].set_color(PALETTE["muted"])
+    axis.tick_params(colors=PALETTE["dark"], labelsize=9)
+    axis.set_xlabel(axis.get_xlabel(), fontsize=10)
+    axis.set_ylabel(axis.get_ylabel(), fontsize=10)
+    axis.set_title(axis.get_title(), fontsize=12, fontweight="bold")
+    axis.set_axisbelow(True)
+    axis.grid(axis="y", color=PALETTE["grid"], linewidth=0.7, alpha=0.8)
+
+
+def _load_input_frame(
+    source: pd.DataFrame | str | Path,
+    *,
+    name: str,
+    max_rows: int = MAX_INPUT_ROWS,
+) -> pd.DataFrame:
+    """Load a DataFrame or an outputs-only CSV under a strict row bound."""
+    if isinstance(source, pd.DataFrame):
+        frame = source
+    else:
+        path = _resolve_output_file(source, default_name="")
+        if path.suffix.casefold() != ".csv":
+            raise ValueError(f"{name} input must be a CSV file.")
+        if not path.is_file():
+            raise FileNotFoundError(f"{name} CSV does not exist: {path}")
+        try:
+            frame = pd.read_csv(path, nrows=max_rows + 1, low_memory=True)
+        except (OSError, pd.errors.ParserError, UnicodeError, ValueError) as error:
+            raise ValueError(f"Could not read {name} CSV {path}: {error}") from error
+
+    if not frame.columns.is_unique:
+        raise ValueError(f"{name} data must not contain duplicate columns.")
+    if len(frame) > max_rows:
+        raise ValueError(
+            f"{name} data exceeds the {max_rows:,}-row visualization limit."
+        )
+    if frame.empty:
+        raise ValueError(f"{name} data contains no rows.")
+    return frame.copy(deep=False)
+
+
+def _save_figure_atomic(figure: Figure, output_path: Path) -> Path:
+    """Save one compact PNG atomically and close the figure on every path."""
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent,
+            prefix=".visualization-",
+            suffix=".png",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        figure.savefig(
+            temporary_path,
+            format="png",
+            dpi=PNG_DPI,
+            bbox_inches="tight",
+            metadata={"Software": "NFL CombAI Edge"},
+        )
+        os.replace(temporary_path, output_path)
+    except OSError as error:
+        raise OSError(f"Could not save plot to {output_path}: {error}") from error
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        plt.close(figure)
+    return output_path
 
 
 def _choose_mode(
@@ -241,15 +349,14 @@ def generate_scatter_plot(
         max_points=max_points,
     )
 
-    figure, axis = plt.subplots(figsize=(6.2, 4.0), constrained_layout=True)
-    temporary_path: Path | None = None
+    figure, axis = plt.subplots(figsize=(6.8, 4.6), constrained_layout=True)
     try:
         axis.scatter(
             x_values,
             y_values,
-            s=20,
-            alpha=0.72,
-            color="#176b87",
+            s=25,
+            alpha=0.78,
+            color=PALETTE["blue"],
             edgecolors="none",
         )
         if mode == "insights":
@@ -263,39 +370,500 @@ def generate_scatter_plot(
                         (x_values[index], y_values[index]),
                         xytext=(4, 3),
                         textcoords="offset points",
-                        fontsize=7,
+                        fontsize=8,
+                        color=PALETTE["dark"],
                     )
         else:
             axis.set_xlabel(x_column.replace("_", " ").title())
             axis.set_ylabel(y_plot_column.replace("_", " ").title())
             axis.set_title(f"Cut efficiency vs. {y_plot_column.replace('_', ' ')}")
-        axis.grid(True, linewidth=0.5, alpha=0.25)
-        with tempfile.NamedTemporaryFile(
-            dir=png_path.parent,
-            prefix=".visualization-",
-            suffix=".png",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-        figure.savefig(
-            temporary_path,
-            format="png",
-            dpi=PNG_DPI,
-            bbox_inches="tight",
-            metadata={"Software": "NFL CombAI Edge"},
+        axis.text(
+            0.99,
+            0.02,
+            f"n = {valid_count:,}" + (
+                f" (sampled {len(x_values):,})"
+                if valid_count > len(x_values)
+                else ""
+            ),
+            transform=axis.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            color=PALETTE["muted"],
         )
-        os.replace(temporary_path, png_path)
-    except OSError as error:
-        raise OSError(f"Could not save plot to {png_path}: {error}") from error
+        _apply_publication_style(axis)
+        _save_figure_atomic(figure, png_path)
     finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-        plt.close(figure)
+        if plt.fignum_exists(figure.number):
+            plt.close(figure)
 
     print(f"Plot mode: {mode}")
     print(f"Valid observations: {valid_count:,}; plotted: {len(x_values):,}")
     print(f"PNG saved to: {png_path}")
     return png_path
+
+
+def _bootstrap_mean_interval(
+    residuals: np.ndarray,
+    *,
+    seed: int = 2027,
+    replicates: int = 1_000,
+) -> tuple[float, float]:
+    """Estimate a percentile 95% CI with at most 5,000 paired residuals."""
+    if residuals.size < 2:
+        raise ValueError("At least two paired observations are required for a CI.")
+    rng = np.random.default_rng(seed)
+    bootstrap_source = residuals
+    if residuals.size > 5_000:
+        bootstrap_source = rng.choice(residuals, size=5_000, replace=False)
+    sample_indices = rng.integers(
+        0,
+        len(bootstrap_source),
+        size=(replicates, len(bootstrap_source)),
+    )
+    bootstrap_means = bootstrap_source[sample_indices].mean(axis=1)
+    lower, upper = np.quantile(bootstrap_means, (0.025, 0.975))
+    return float(lower), float(upper)
+
+
+def _target_columns_for_predictions(
+    frame: pd.DataFrame,
+    target: str,
+) -> tuple[str, str, str | None, str | None] | None:
+    """Resolve actual/predicted and optional per-row interval columns."""
+    columns = [str(column) for column in frame.columns]
+    actual_column = _match_column(columns, ACTUAL_COLUMN_CANDIDATES[target])
+    predicted_column = _match_column(columns, PREDICTION_COLUMN_CANDIDATES[target])
+    if actual_column is None or predicted_column is None:
+        return None
+
+    aliases = ("yac", "yards_after_catch") if target == "yards_after_catch" else ("epa",)
+    lower_candidates = tuple(
+        candidate
+        for alias in aliases
+        for candidate in (
+            f"{alias}_prediction_lower",
+            f"{alias}_ci_lower",
+            f"{alias}_lower",
+        )
+    )
+    upper_candidates = tuple(
+        candidate
+        for alias in aliases
+        for candidate in (
+            f"{alias}_prediction_upper",
+            f"{alias}_ci_upper",
+            f"{alias}_upper",
+        )
+    )
+    lower_column = _match_column(columns, lower_candidates)
+    upper_column = _match_column(columns, upper_candidates)
+    if (lower_column is None) != (upper_column is None):
+        raise ValueError(
+            f"{target} prediction intervals require both lower and upper bounds."
+        )
+    return actual_column, predicted_column, lower_column, upper_column
+
+
+def _plot_prediction_comparison(
+    frame: pd.DataFrame,
+    *,
+    target: str,
+    output_path: Path,
+    max_points: int,
+) -> Path:
+    """Plot actual versus out-of-sample predictions with honest uncertainty."""
+    resolved = _target_columns_for_predictions(frame, target)
+    if resolved is None:
+        raise ValueError(
+            f"Prediction data must contain actual and predicted {target} columns."
+        )
+    actual_column, predicted_column, lower_column, upper_column = resolved
+    required_columns = [actual_column, predicted_column]
+    if lower_column is not None and upper_column is not None:
+        required_columns.extend([lower_column, upper_column])
+    plot_data = frame.loc[:, required_columns].apply(pd.to_numeric, errors="coerce")
+    plot_data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    plot_data.dropna(subset=[actual_column, predicted_column], inplace=True)
+    if len(plot_data) < 2:
+        raise ValueError(
+            f"At least two paired finite actual/predicted {target} rows are required."
+        )
+
+    residuals = (
+        plot_data[predicted_column].to_numpy(dtype=float)
+        - plot_data[actual_column].to_numpy(dtype=float)
+    )
+    if lower_column is not None and upper_column is not None:
+        all_lower = plot_data[lower_column].to_numpy(dtype=float)
+        all_upper = plot_data[upper_column].to_numpy(dtype=float)
+        supplied_bounds = np.isfinite(all_lower) & np.isfinite(all_upper)
+        if np.any(supplied_bounds & (all_lower > all_upper)):
+            raise ValueError(
+                f"{target} prediction lower bounds cannot exceed upper bounds."
+            )
+        all_predictions = plot_data[predicted_column].to_numpy(dtype=float)
+        if np.any(
+            supplied_bounds
+            & ((all_lower > all_predictions) | (all_predictions > all_upper))
+        ):
+            raise ValueError(
+                f"{target} prediction intervals must enclose each prediction."
+            )
+    ci_lower, ci_upper = _bootstrap_mean_interval(residuals)
+    full_count = len(plot_data)
+    if full_count > max_points:
+        plot_data = plot_data.sample(
+            n=max_points,
+            random_state=2027,
+        ).sort_index()
+    actual = plot_data[actual_column].to_numpy(dtype=float)
+    predicted = plot_data[predicted_column].to_numpy(dtype=float)
+
+    figure, axis = plt.subplots(figsize=(6.8, 5.2), constrained_layout=True)
+    try:
+        if lower_column is not None and upper_column is not None:
+            lower = plot_data[lower_column].to_numpy(dtype=float)
+            upper = plot_data[upper_column].to_numpy(dtype=float)
+            supplied_bounds = np.isfinite(lower) & np.isfinite(upper)
+            valid_intervals = (
+                supplied_bounds
+            )
+            if np.any(valid_intervals):
+                axis.errorbar(
+                    actual[valid_intervals],
+                    predicted[valid_intervals],
+                    yerr=np.vstack(
+                        (
+                            predicted[valid_intervals] - lower[valid_intervals],
+                            upper[valid_intervals] - predicted[valid_intervals],
+                        )
+                    ),
+                    fmt="none",
+                    ecolor=PALETTE["muted"],
+                    elinewidth=0.7,
+                    capsize=2,
+                    alpha=0.5,
+                    zorder=1,
+                )
+
+        axis.scatter(
+            actual,
+            predicted,
+            s=27,
+            color=PALETTE["blue"],
+            alpha=0.78,
+            edgecolors="white",
+            linewidths=0.35,
+            zorder=2,
+        )
+        value_min = float(min(actual.min(), predicted.min()))
+        value_max = float(max(actual.max(), predicted.max()))
+        padding = (value_max - value_min) * 0.04 or max(abs(value_min), 1.0) * 0.04
+        axis.plot(
+            [value_min - padding, value_max + padding],
+            [value_min - padding, value_max + padding],
+            linestyle="--",
+            linewidth=1.1,
+            color=PALETTE["orange"],
+            label="Perfect prediction",
+        )
+        axis.set_xlim(value_min - padding, value_max + padding)
+        axis.set_ylim(value_min - padding, value_max + padding)
+        target_label = "Yards after catch" if target == "yards_after_catch" else "EPA"
+        axis.set_xlabel(f"Actual {target_label}")
+        axis.set_ylabel(f"Predicted {target_label}")
+        axis.set_title(f"{target_label}: predicted vs. actual")
+        rmse = float(np.sqrt(np.mean(np.square(residuals))))
+        mae = float(np.mean(np.abs(residuals)))
+        interval_label = (
+            "Per-player bounds: provided prediction intervals"
+            if lower_column is not None
+            else "Per-player prediction intervals not supplied"
+        )
+        axis.text(
+            0.03,
+            0.97,
+            (
+                f"n = {full_count:,}  |  RMSE = {rmse:.3g}  |  MAE = {mae:.3g}\n"
+                f"Mean error 95% paired-bootstrap CI: [{ci_lower:.3g}, {ci_upper:.3g}]\n"
+                f"{interval_label}"
+            ),
+            transform=axis.transAxes,
+            va="top",
+            ha="left",
+            fontsize=8,
+            color=PALETTE["dark"],
+            bbox={
+                "boxstyle": "round,pad=0.45",
+                "facecolor": "white",
+                "edgecolor": PALETTE["grid"],
+                "alpha": 0.95,
+            },
+        )
+        axis.legend(frameon=False, loc="lower right", fontsize=8)
+        _apply_publication_style(axis)
+        return _save_figure_atomic(figure, output_path)
+    finally:
+        if plt.fignum_exists(figure.number):
+            plt.close(figure)
+
+
+def _plot_kinematics(
+    source: pd.DataFrame | str | Path,
+    *,
+    output_path: Path,
+    max_points: int,
+) -> Path:
+    """Render one representative 10 Hz velocity profile and sharp-cut scores."""
+    frame = _load_input_frame(source, name="Kinematics")
+    frame = frame.reset_index(drop=True)
+    if {"vx", "vy", "speed"}.issubset(frame.columns):
+        features = frame.copy(deep=False)
+    elif {"game_id", "play_id", "player_id", "frame_id", "x", "y"}.issubset(
+        frame.columns
+    ):
+        from_feature_engineering = _feature_engineering_module()
+        features = from_feature_engineering.run_feature_pipeline(frame)
+    else:
+        raise ValueError(
+            "Kinematics input needs vx/vy/speed features or raw tracking columns."
+        )
+
+    required = {"player_id", "frame_id", "speed"}
+    missing = sorted(required - set(features.columns))
+    if missing:
+        raise ValueError(
+            "Kinematics data is missing columns: " + ", ".join(missing)
+        )
+    frame_id = pd.to_numeric(features["frame_id"], errors="coerce")
+    speed = pd.to_numeric(features["speed"], errors="coerce")
+    finite = np.isfinite(frame_id.to_numpy(dtype=float)) & np.isfinite(
+        speed.to_numpy(dtype=float)
+    )
+    features = features.loc[finite].copy()
+    features["frame_id"] = frame_id.loc[finite]
+    features["speed"] = speed.loc[finite]
+    if features.empty:
+        raise ValueError("Kinematics data has no finite frame/speed observations.")
+
+    track_columns = [
+        column
+        for column in ("game_id", "play_id", "player_id")
+        if column in features.columns
+    ]
+    chosen_track = (
+        features.sort_values([*track_columns, "frame_id"], kind="mergesort")
+        .groupby(track_columns, sort=False, dropna=False, observed=True)
+        .head(1)
+        .iloc[0]
+    )
+    chosen_mask = pd.Series(True, index=features.index)
+    for column in track_columns:
+        chosen_mask &= features[column].eq(chosen_track[column])
+    profile = features.loc[chosen_mask].sort_values("frame_id", kind="mergesort")
+    if len(profile) > max_points:
+        positions = np.linspace(0, len(profile) - 1, max_points, dtype=int)
+        profile = profile.iloc[positions]
+
+    times = (profile["frame_id"].to_numpy(dtype=float) - float(profile["frame_id"].iloc[0])) / 10.0
+    figure, (speed_axis, cut_axis) = plt.subplots(
+        2,
+        1,
+        figsize=(8.0, 6.4),
+        constrained_layout=True,
+        gridspec_kw={"height_ratios": [1.25, 1.0]},
+    )
+    try:
+        speed_axis.plot(
+            times,
+            profile["speed"].to_numpy(dtype=float),
+            color=PALETTE["blue"],
+            linewidth=1.8,
+            label="Smoothed speed",
+        )
+        if "is_sharp_cut" in profile.columns:
+            sharp = profile["is_sharp_cut"].fillna(False).astype(bool)
+            speed_axis.scatter(
+                times[sharp.to_numpy()],
+                profile.loc[sharp, "speed"],
+                s=42,
+                color=PALETTE["orange"],
+                edgecolors="white",
+                linewidths=0.6,
+                label="Sharp cut (>45°)",
+                zorder=3,
+            )
+        speed_axis.set_title(
+            f"10 Hz velocity profile · player {chosen_track['player_id']}"
+        )
+        speed_axis.set_xlabel("Elapsed time (s)")
+        speed_axis.set_ylabel("Speed (yd/s)")
+        speed_axis.legend(frameon=False, ncol=2, fontsize=8)
+        _apply_publication_style(speed_axis)
+
+        if {
+            "direction_change_degrees",
+            "proprietary_cut_efficiency",
+        }.issubset(profile.columns):
+            cut_data = profile.loc[
+                profile.get(
+                    "is_sharp_cut",
+                    pd.Series(False, index=profile.index),
+                ).fillna(False).astype(bool)
+            ]
+            angles = pd.to_numeric(
+                cut_data["direction_change_degrees"],
+                errors="coerce",
+            )
+            efficiencies = pd.to_numeric(
+                cut_data["proprietary_cut_efficiency"],
+                errors="coerce",
+            )
+            valid = np.isfinite(angles.to_numpy(dtype=float)) & np.isfinite(
+                efficiencies.to_numpy(dtype=float)
+            )
+            cut_axis.scatter(
+                angles.loc[valid],
+                efficiencies.loc[valid],
+                s=42,
+                color=PALETTE["green"],
+                alpha=0.82,
+                edgecolors="white",
+                linewidths=0.5,
+            )
+            cut_axis.axvline(
+                45.0,
+                linestyle="--",
+                linewidth=1.0,
+                color=PALETTE["orange"],
+                label="45° threshold",
+            )
+            if not np.any(valid):
+                cut_axis.text(
+                    0.5,
+                    0.5,
+                    "No sharp cuts with a defined efficiency in this track",
+                    transform=cut_axis.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color=PALETTE["muted"],
+                )
+        else:
+            cut_axis.text(
+                0.5,
+                0.5,
+                "Cut angle/efficiency columns are not available",
+                transform=cut_axis.transAxes,
+                ha="center",
+                va="center",
+                fontsize=9,
+                color=PALETTE["muted"],
+            )
+        cut_axis.set_title("Sharp-cut speed retention")
+        cut_axis.set_xlabel("Direction change (degrees)")
+        cut_axis.set_ylabel("Exit speed / entry speed")
+        if {
+            "direction_change_degrees",
+            "proprietary_cut_efficiency",
+        }.issubset(profile.columns):
+            cut_axis.legend(frameon=False, fontsize=8)
+        _apply_publication_style(cut_axis)
+        return _save_figure_atomic(figure, output_path)
+    finally:
+        if plt.fignum_exists(figure.number):
+            plt.close(figure)
+
+
+def _feature_engineering_module():
+    """Import feature engineering for both script and package execution."""
+    if __package__:
+        from . import feature_engineering
+    else:
+        import feature_engineering
+    return feature_engineering
+
+
+def generate_project_visualizations(
+    tracking_data: pd.DataFrame | str | Path | None = None,
+    predictions_data: pd.DataFrame | str | Path | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    max_points: int = MAX_PLOT_POINTS,
+) -> dict[str, Path]:
+    """Generate available project plots and return their output paths.
+
+    ``tracking_data`` may be raw tracking or feature-engineered observations.
+    ``predictions_data`` must contain paired, genuinely out-of-sample actual
+    and predicted EPA/YAC values. Optional ``epa_lower``/``epa_upper`` (or
+    corresponding YAC interval fields) add per-observation prediction bounds;
+    the plotted mean-error 95% interval is bootstrapped from paired residuals.
+    No interval is invented when per-player prediction bounds are absent.
+
+    CSV inputs are restricted to ``outputs/`` and capped at 250,000 rows.
+    DataFrames are accepted for in-memory use. Figures are saved atomically
+    only directly under the project ``outputs/`` directory.
+    """
+    if (
+        isinstance(max_points, bool)
+        or not isinstance(max_points, int)
+        or max_points < 2
+    ):
+        raise ValueError("max_points must be an integer of at least 2.")
+
+    outputs_dir = _outputs_dir()
+    if output_dir is not None:
+        requested_output = Path(output_dir)
+        if not requested_output.is_absolute():
+            requested_output = Path(__file__).resolve().parent.parent / requested_output
+        resolved_output = requested_output.resolve()
+        if resolved_output != outputs_dir:
+            raise ValueError("All generated images must be saved directly in outputs/.")
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    if tracking_data is None:
+        default_tracking = outputs_dir / "tracking_features.csv"
+        if default_tracking.is_file():
+            tracking_data = default_tracking
+    if predictions_data is None:
+        default_predictions = outputs_dir / "model_predictions.csv"
+        if default_predictions.is_file():
+            predictions_data = default_predictions
+    if tracking_data is None and predictions_data is None:
+        raise ValueError(
+            "Provide tracking_data and/or predictions_data; no default visualization "
+            "inputs were found in outputs/."
+        )
+
+    outputs: dict[str, Path] = {}
+    if tracking_data is not None:
+        outputs["kinematics"] = _plot_kinematics(
+            tracking_data,
+            output_path=outputs_dir / "kinematics_and_cut_efficiency.png",
+            max_points=max_points,
+        )
+    if predictions_data is not None:
+        predictions = _load_input_frame(predictions_data, name="Prediction")
+        for target, output_name in (
+            ("epa", "epa_actual_vs_predicted.png"),
+            ("yards_after_catch", "yac_actual_vs_predicted.png"),
+        ):
+            if _target_columns_for_predictions(predictions, target) is not None:
+                outputs[target] = _plot_prediction_comparison(
+                    predictions,
+                    target=target,
+                    output_path=outputs_dir / output_name,
+                    max_points=max_points,
+                )
+        if not any(key in outputs for key in ("epa", "yards_after_catch")):
+            raise ValueError(
+                "Prediction data must contain actual and predicted EPA and/or YAC."
+            )
+
+    for name, path in outputs.items():
+        print(f"{name} visualization saved to: {path}")
+    return outputs
 
 
 class _VisualizationTest(unittest.TestCase):
@@ -310,6 +878,12 @@ class _VisualizationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.input_path.unlink(missing_ok=True)
         self.output_path.unlink(missing_ok=True)
+        for generated_name in (
+            "kinematics_and_cut_efficiency.png",
+            "epa_actual_vs_predicted.png",
+            "yac_actual_vs_predicted.png",
+        ):
+            (self.outputs_dir / generated_name).unlink(missing_ok=True)
 
     def test_player_level_scatter_is_saved_as_png(self) -> None:
         pd.DataFrame(
@@ -348,6 +922,87 @@ class _VisualizationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outputs directory"):
             generate_scatter_plot("..\\data\\tracking.csv", self.output_path)
 
+    def test_generates_kinematics_and_prediction_comparison_figures(self) -> None:
+        from_feature_engineering = _feature_engineering_module()
+        tracking = pd.DataFrame(
+            {
+                "game_id": [1] * 5,
+                "play_id": [2] * 5,
+                "player_id": [10] * 5,
+                "frame_id": [1, 2, 3, 4, 5],
+                "x": [0.0, 1.0, 2.0, 2.0, 2.0],
+                "y": [0.0, 0.0, 0.0, 1.0, 2.0],
+            }
+        )
+        features = from_feature_engineering.run_feature_pipeline(tracking)
+        predictions = pd.DataFrame(
+            {
+                "actual_epa": [-0.2, 0.1, 0.3, 0.5],
+                "predicted_epa": [-0.1, 0.0, 0.25, 0.45],
+                "epa_lower": [-0.3, -0.1, 0.1, 0.3],
+                "epa_upper": [0.1, 0.1, 0.4, 0.6],
+                "actual_yac": [1.0, 4.0, 7.0, 10.0],
+                "predicted_yac": [1.5, 3.5, 7.5, 9.5],
+            }
+        )
+        with patch(
+            f"{__name__}._outputs_dir",
+            return_value=self.outputs_dir.resolve(),
+        ):
+            generated = generate_project_visualizations(
+                features,
+                predictions,
+                max_points=10,
+            )
+
+        self.assertEqual(set(generated), {"kinematics", "epa", "yards_after_catch"})
+        for path in generated.values():
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            path.unlink()
+
+    def test_prediction_requires_paired_actual_and_predicted_targets(self) -> None:
+        incomplete = pd.DataFrame(
+            {
+                "actual_epa": [0.1, 0.2],
+                "actual_yac": [2.0, 3.0],
+            }
+        )
+        with patch(
+            f"{__name__}._outputs_dir",
+            return_value=self.outputs_dir.resolve(),
+        ):
+            with self.assertRaisesRegex(ValueError, "actual and predicted EPA and/or YAC"):
+                generate_project_visualizations(predictions_data=incomplete)
+
+    def test_prediction_interval_bounds_must_be_paired(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "actual_epa": [0.1, 0.2],
+                "predicted_epa": [0.0, 0.3],
+                "epa_lower": [-0.1, 0.1],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "both lower and upper"):
+            _target_columns_for_predictions(frame, "epa")
+
+    def test_prediction_interval_must_enclose_prediction(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "actual_epa": [0.1, 0.2],
+                "predicted_epa": [0.0, 0.3],
+                "epa_lower": [-0.2, 0.4],
+                "epa_upper": [0.1, 0.5],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "must enclose each prediction"):
+            _plot_prediction_comparison(
+                frame,
+                target="epa",
+                output_path=self.output_path,
+                max_points=10,
+            )
+
 
 def main() -> int:
     """Run validation tests or render a chart from a local outputs CSV."""
@@ -376,6 +1031,19 @@ def main() -> int:
         help=f"Maximum rows to plot (default: {MAX_PLOT_POINTS})",
     )
     parser.add_argument(
+        "--tracking-data",
+        type=Path,
+        help="Raw tracking or feature CSV in outputs/ for the velocity/cut dashboard.",
+    )
+    parser.add_argument(
+        "--predictions-data",
+        type=Path,
+        help=(
+            "CSV in outputs/ containing actual/predicted EPA and/or YAC "
+            "for comparison plots."
+        ),
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Run standalone mock-data tests and remove their temporary artifacts",
@@ -388,12 +1056,21 @@ def main() -> int:
         return 0 if result.wasSuccessful() else 1
 
     try:
-        generate_scatter_plot(
-            args.input_path,
-            args.output,
-            y_column=args.y_column,
-            max_points=args.max_points,
-        )
+        if args.tracking_data is not None or args.predictions_data is not None:
+            if args.y_column is not None:
+                parser.error("--y-column applies only to the legacy scatter plot mode")
+            generate_project_visualizations(
+                tracking_data=args.tracking_data,
+                predictions_data=args.predictions_data,
+                max_points=args.max_points,
+            )
+        else:
+            generate_scatter_plot(
+                args.input_path,
+                args.output,
+                y_column=args.y_column,
+                max_points=args.max_points,
+            )
     except (OSError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
