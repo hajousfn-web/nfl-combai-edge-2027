@@ -21,6 +21,11 @@ from sklearn.model_selection import GridSearchCV, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+if __package__:
+    from . import statistical_audit
+else:
+    import statistical_audit
+
 
 PLAYER_KEY_CANDIDATES = (
     "nflid",
@@ -292,6 +297,16 @@ def integrate_combine_with_season_performance(
             "Both inputs require a player identifier (nflId preferred, then "
             "playerId, player_identifier, or player)."
         )
+    statistical_audit.validate_player_identifier_consistency(
+        player_summary_df,
+        preferred_column=summary_key,
+        table_name="Combine player summaries",
+    )
+    statistical_audit.validate_player_identifier_consistency(
+        regular_season_df,
+        preferred_column=season_key,
+        table_name="Regular-season performance data",
+    )
     draft_year_column = _find_column(player_summary_df, ("draft_year",))
     if draft_year_column is None:
         raise ValueError(
@@ -333,6 +348,12 @@ def integrate_combine_with_season_performance(
 
     summary_columns = list(dict.fromkeys([*player_summary_df.columns, draft_year_column]))
     summary = player_summary_df.loc[:, summary_columns].copy()
+    statistical_audit.validate_linkage_keys(
+        summary,
+        table_name="Combine player summaries",
+        key_columns=(summary_key,),
+        unique=True,
+    )
     summary[draft_year_column] = pd.to_numeric(
         summary[draft_year_column], errors="coerce"
     )
@@ -381,6 +402,16 @@ def integrate_combine_with_season_performance(
     season["_integration_player_key"] = _safe_player_key(season[season_key])
     season = season.loc[season["_integration_player_key"].notna()].copy()
 
+    statistical_audit.validate_linkage_keys(
+        season,
+        table_name="Regular-season performance data",
+        key_columns=tuple(
+            column
+            for column in (season_key, season_column, game_id_column if season_column is None else None)
+            if column is not None
+        ),
+        unique=False,
+    )
     if season_column is None:
         if games_df is None or game_id_column is None:
             raise ValueError(
@@ -391,6 +422,18 @@ def integrate_combine_with_season_performance(
         if games_game_id is None or games_season is None:
             raise ValueError("games_df must contain game_id and season columns.")
         games = games_df.loc[:, [games_game_id, games_season]].copy()
+        statistical_audit.validate_linkage_keys(
+            games,
+            table_name="Games data",
+            key_columns=(games_game_id, games_season),
+            unique=False,
+        )
+        statistical_audit.validate_linkage_keys(
+            games,
+            table_name="Games data",
+            key_columns=(games_game_id,),
+            unique=True,
+        )
         games["_integration_game_key"] = _safe_player_key(games[games_game_id])
         games[games_season] = pd.to_numeric(games[games_season], errors="coerce")
         games = games.loc[

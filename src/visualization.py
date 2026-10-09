@@ -21,12 +21,13 @@ import numpy as np
 import pandas as pd
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
 
 MAX_PLOT_POINTS = 10_000
 CHUNK_SIZE = 50_000
 MAX_INPUT_ROWS = 250_000
-PNG_DPI = 180
+PNG_DPI = 240
 PALETTE = {
     "blue": "#0072B2",
     "orange": "#D55E00",
@@ -866,6 +867,453 @@ def generate_project_visualizations(
     return outputs
 
 
+def _load_optional_audit_frame(
+    source: pd.DataFrame | str | Path | None,
+    *,
+    default_name: str,
+    label: str,
+) -> pd.DataFrame | None:
+    if source is None:
+        candidate = _outputs_dir() / default_name
+        if not candidate.is_file():
+            return None
+        source = candidate
+    return _load_input_frame(source, name=label)
+
+
+def _empty_state_message(axis: Axes, message: str) -> None:
+    axis.text(
+        0.5,
+        0.5,
+        message,
+        transform=axis.transAxes,
+        ha="center",
+        va="center",
+        color=PALETTE["muted"],
+        fontsize=10,
+        wrap=True,
+    )
+    axis.set_axis_off()
+
+
+def _plot_partial_spearman_windows(
+    frame: pd.DataFrame | None,
+    *,
+    output_path: Path,
+) -> Path:
+    figure, axis = plt.subplots(figsize=(9.2, 5.2), constrained_layout=True)
+    try:
+        if frame is None or frame.empty:
+            _empty_state_message(
+                axis,
+                "No partial-Spearman audit data available.\n"
+                "Run the pipeline with verified player-season outcomes.",
+            )
+            figure.suptitle(
+                "Partial Spearman by validation window",
+                fontsize=15,
+                fontweight="bold",
+                color=PALETTE["dark"],
+            )
+            return _save_figure_atomic(figure, output_path)
+
+        required = {
+            "validation_window",
+            "target_metric",
+            "partial_spearman_rho",
+            "permutation_p_value",
+            "sample_count",
+            "status",
+        }
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise ValueError(
+                "Partial-Spearman audit is missing columns: " + ", ".join(missing)
+            )
+        usable = frame.loc[
+            frame["status"].eq("ok")
+            & pd.to_numeric(frame["partial_spearman_rho"], errors="coerce").notna()
+        ].copy()
+        windows = frame["validation_window"].astype(str).drop_duplicates().tolist()
+        targets = frame["target_metric"].astype(str).drop_duplicates().tolist()
+        if usable.empty:
+            statuses = ", ".join(
+                f"{row.validation_window}: {row.status}"
+                for row in frame[["validation_window", "status"]]
+                .drop_duplicates()
+                .itertuples(index=False)
+            )
+            _empty_state_message(
+                axis,
+                "No window has enough valid observations for an estimate.\n"
+                + statuses,
+            )
+        else:
+            x_positions = np.arange(len(windows), dtype=float)
+            offsets = np.linspace(-0.18, 0.18, max(1, len(targets)))
+            for target_index, target in enumerate(targets):
+                selected = usable.loc[usable["target_metric"].astype(str).eq(target)]
+                window_indices = {
+                    window: index for index, window in enumerate(windows)
+                }
+                xs = [
+                    window_indices[str(window)]
+                    + offsets[target_index]
+                    for window in selected["validation_window"]
+                ]
+                ys = pd.to_numeric(
+                    selected["partial_spearman_rho"], errors="coerce"
+                ).to_numpy(dtype=float)
+                p_values = pd.to_numeric(
+                    selected["permutation_p_value"], errors="coerce"
+                ).to_numpy(dtype=float)
+                sizes = pd.to_numeric(
+                    selected["sample_count"], errors="coerce"
+                ).fillna(0).to_numpy(dtype=float)
+                color = (
+                    PALETTE["blue"]
+                    if target_index % 2 == 0
+                    else PALETTE["orange"]
+                )
+                axis.scatter(
+                    xs,
+                    ys,
+                    s=58,
+                    color=color,
+                    edgecolor="white",
+                    linewidth=0.8,
+                    label=target.replace("_", " ").upper(),
+                    zorder=3,
+                )
+                for x_value, y_value, p_value, count in zip(
+                    xs, ys, p_values, sizes
+                ):
+                    axis.annotate(
+                        f"n={int(count)}, p={p_value:.2g}",
+                        (x_value, y_value),
+                        xytext=(0, 9),
+                        textcoords="offset points",
+                        ha="center",
+                        fontsize=8,
+                        color=PALETTE["muted"],
+                    )
+            axis.axhline(0, color=PALETTE["dark"], linewidth=0.9, alpha=0.65)
+            axis.set_xticks(x_positions, windows, rotation=15, ha="right")
+            axis.set_ylim(-1.05, 1.05)
+            axis.set_ylabel("Partial Spearman ρ")
+            axis.set_xlabel("Audit window (overall and draft-class strata)")
+            axis.legend(frameon=False, ncols=min(2, len(targets)))
+            _apply_publication_style(axis)
+
+        figure.suptitle(
+            "Partial Spearman by validation window",
+            fontsize=15,
+            fontweight="bold",
+            color=PALETTE["dark"],
+        )
+        figure.text(
+            0.5,
+            -0.025,
+            "Permutation inference is exploratory; per-class estimates may be unavailable "
+            "when sample size or controls are insufficient.",
+            ha="center",
+            fontsize=8,
+            color=PALETTE["muted"],
+        )
+        return _save_figure_atomic(figure, output_path)
+    finally:
+        if plt.fignum_exists(figure.number):
+            plt.close(figure)
+
+
+def _plot_forward_validation_deltas(
+    frame: pd.DataFrame | None,
+    *,
+    output_path: Path,
+) -> Path:
+    figure, axes = plt.subplots(
+        1, 3, figsize=(13.0, 5.4), constrained_layout=True
+    )
+    try:
+        metrics = (
+            ("rmse", "RMSE Δ (Base − Base+CE)", True),
+            ("mae", "MAE Δ (Base − Base+CE)", True),
+            ("r2", "R² Δ (Base+CE − Base)", False),
+        )
+        if frame is None or frame.empty:
+            for axis, (_, title, _) in zip(axes, metrics):
+                axis.set_title(title)
+                _empty_state_message(
+                    axis,
+                    "No forward-validation results.\n"
+                    "Run the pipeline with verified labels.",
+                )
+            figure.suptitle(
+                "Forward draft-class validation: Base vs. Base + CE",
+                fontsize=15,
+                fontweight="bold",
+                color=PALETTE["dark"],
+            )
+            return _save_figure_atomic(figure, output_path)
+
+        required = {
+            "target_metric",
+            "test_draft_year",
+            "model_variant",
+            "status",
+            "rmse",
+            "mae",
+            "r2",
+        }
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise ValueError(
+                "Forward-validation data is missing columns: " + ", ".join(missing)
+            )
+        clean = frame.loc[frame["status"].eq("ok")].copy()
+        paired = clean.pivot_table(
+            index=["target_metric", "test_draft_year"],
+            columns="model_variant",
+            values=["rmse", "mae", "r2"],
+            aggfunc="first",
+        )
+        has_variants = (
+            (not paired.empty)
+            and ("base" in paired.columns.get_level_values(1))
+            and ("base_plus_metric" in paired.columns.get_level_values(1))
+        )
+        if not has_variants:
+            for axis, (_, title, _) in zip(axes, metrics):
+                axis.set_title(title)
+                _empty_state_message(
+                    axis,
+                    "No paired Base and Base+CE folds.\n"
+                    "Check fold sample counts and model statuses.",
+                )
+        else:
+            categories = [
+                f"{metric.upper()} · {int(year)}"
+                for metric, year in paired.index
+            ]
+            x_values = np.arange(len(categories))
+            for axis, (metric, title, lower_is_better) in zip(axes, metrics):
+                base_values = paired[(metric, "base")].to_numpy(dtype=float)
+                enhanced_values = paired[(metric, "base_plus_metric")].to_numpy(
+                    dtype=float
+                )
+                delta = (
+                    base_values - enhanced_values
+                    if lower_is_better
+                    else enhanced_values - base_values
+                )
+                finite = np.isfinite(delta)
+                if not finite.any():
+                    axis.set_title(title)
+                    _empty_state_message(
+                        axis,
+                        "No finite paired metric scores in valid folds.",
+                    )
+                    continue
+                metric_positions = x_values[finite]
+                metric_categories = np.asarray(categories)[finite]
+                delta = delta[finite]
+                colors = [
+                    PALETTE["green"] if value > 0 else PALETTE["orange"]
+                    for value in delta
+                ]
+                axis.bar(metric_positions, delta, color=colors, width=0.68)
+                axis.axhline(0, color=PALETTE["dark"], linewidth=0.9)
+                axis.set_xticks(
+                    metric_positions, metric_categories, rotation=45, ha="right"
+                )
+                axis.set_title(title)
+                axis.set_ylabel("Positive favors Base+CE")
+                _apply_publication_style(axis)
+                if len(delta):
+                    padding = max(float(np.nanmax(np.abs(delta))) * 0.08, 0.01)
+                    for position, value in zip(metric_positions, delta):
+                        axis.annotate(
+                            f"{value:+.3g}",
+                            (position, value),
+                            xytext=(0, 4 if value >= 0 else -12),
+                            textcoords="offset points",
+                            ha="center",
+                            fontsize=8,
+                        )
+                    axis.set_ylim(
+                        min(0.0, float(np.nanmin(delta)) - padding),
+                        max(0.0, float(np.nanmax(delta)) + padding),
+                    )
+        figure.suptitle(
+            "Forward draft-class validation: Base vs. Base + CE",
+            fontsize=15,
+            fontweight="bold",
+            color=PALETTE["dark"],
+        )
+        figure.text(
+            0.5,
+            -0.025,
+            "Positive deltas favor Base+CE; scores are out-of-class only when both "
+            "paired fold variants are valid.",
+            ha="center",
+            fontsize=8,
+            color=PALETTE["muted"],
+        )
+        return _save_figure_atomic(figure, output_path)
+    finally:
+        if plt.fignum_exists(figure.number):
+            plt.close(figure)
+
+
+def _plot_fsm_sequence(*, output_path: Path) -> Path:
+    """Render all reference states and manual-reset paths; illustrative only."""
+    nodes = {
+        "SAFE": (0.0, 1.0, PALETTE["green"]),
+        "WARNING": (2.2, 1.0, PALETTE["yellow"]),
+        "DANGER": (4.4, 1.0, PALETTE["orange"]),
+        "EMERGENCY_STOP": (6.6, 1.0, PALETTE["purple"]),
+        "SENSOR_FAULT": (2.2, -0.6, PALETTE["sky"]),
+        "FAIL_SAFE_LOCKED": (4.4, -0.6, PALETTE["dark"]),
+    }
+    transitions = [
+        ("SAFE", "WARNING", "escalate"),
+        ("WARNING", "DANGER", "escalate"),
+        ("DANGER", "EMERGENCY_STOP", "latch"),
+        ("SAFE", "SENSOR_FAULT", "invalid sample"),
+        ("SENSOR_FAULT", "FAIL_SAFE_LOCKED", "system fault"),
+        ("EMERGENCY_STOP", "SAFE", "manual reset"),
+        ("SENSOR_FAULT", "SAFE", "manual reset"),
+        ("FAIL_SAFE_LOCKED", "SAFE", "manual reset"),
+    ]
+    figure, axis = plt.subplots(figsize=(11.2, 5.2), constrained_layout=True)
+    try:
+        for source, target, label in transitions:
+            source_x, source_y, _ = nodes[source]
+            target_x, target_y, _ = nodes[target]
+            is_reset = label == "manual reset"
+            arc = 0.25 if (source, target) in {
+                ("FAIL_SAFE_LOCKED", "SAFE"),
+                ("EMERGENCY_STOP", "SAFE"),
+            } else 0.0
+            axis.add_patch(
+                FancyArrowPatch(
+                    (source_x + 0.46, source_y),
+                    (target_x - 0.48, target_y),
+                    connectionstyle=f"arc3,rad={arc}",
+                    arrowstyle="-|>",
+                    mutation_scale=13,
+                    linewidth=1.5,
+                    linestyle="--" if is_reset else "-",
+                    color=PALETTE["blue"] if is_reset else PALETTE["muted"],
+                    zorder=1,
+                )
+            )
+            midpoint_x = (source_x + target_x) / 2
+            midpoint_y = (source_y + target_y) / 2 + (0.12 if is_reset else 0.16)
+            axis.text(
+                midpoint_x,
+                midpoint_y,
+                label,
+                ha="center",
+                va="center",
+                fontsize=7,
+                color=PALETTE["blue"] if is_reset else PALETTE["muted"],
+                bbox={
+                    "boxstyle": "round,pad=0.15",
+                    "facecolor": "white",
+                    "edgecolor": "none",
+                    "alpha": 0.9,
+                },
+                zorder=3,
+            )
+        for name, (x_value, y_value, color) in nodes.items():
+            axis.add_patch(
+                FancyBboxPatch(
+                    (x_value - 0.48, y_value - 0.22),
+                    0.96,
+                    0.44,
+                    boxstyle="round,pad=0.06",
+                    facecolor=color,
+                    edgecolor="white",
+                    linewidth=1.2,
+                    zorder=2,
+                )
+            )
+            axis.text(
+                x_value,
+                y_value,
+                name,
+                ha="center",
+                va="center",
+                fontsize=7 if len(name) > 12 else 8,
+                fontweight="bold",
+                color="white" if name in {"DANGER", "EMERGENCY_STOP", "FAIL_SAFE_LOCKED"} else PALETTE["dark"],
+                zorder=3,
+            )
+        axis.set_xlim(-0.9, 7.55)
+        axis.set_ylim(-1.15, 1.7)
+        axis.set_axis_off()
+        axis.set_title(
+            "Edge FSM state transitions — illustrative contract",
+            fontsize=14,
+            fontweight="bold",
+            color=PALETTE["dark"],
+        )
+        figure.text(
+            0.5,
+            0.005,
+            "Illustration only: no measured risk scores or approved thresholds. "
+            "Latched states clear only by explicit software manual reset.",
+            ha="center",
+            fontsize=8,
+            color=PALETTE["muted"],
+        )
+        return _save_figure_atomic(figure, output_path)
+    finally:
+        if plt.fignum_exists(figure.number):
+            plt.close(figure)
+
+
+def generate_audit_visualizations(
+    partial_spearman_data: pd.DataFrame | str | Path | None = None,
+    forward_validation_data: pd.DataFrame | str | Path | None = None,
+) -> dict[str, Path]:
+    """Generate two evidence-driven audit charts plus an FSM contract figure.
+
+    Audit charts show results only when supplied or present in ``outputs/``;
+    otherwise they contain an explicit no-data message. The FSM sequence is
+    always labeled illustrative and contains no risk thresholds.
+    """
+    outputs_dir = _outputs_dir()
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    partial = _load_optional_audit_frame(
+        partial_spearman_data,
+        default_name="partial_spearman_permutation_audit.csv",
+        label="Partial-Spearman audit",
+    )
+    forward = _load_optional_audit_frame(
+        forward_validation_data,
+        default_name="forward_draft_class_validation.csv",
+        label="Forward-validation audit",
+    )
+    results = {
+        "partial_spearman": _plot_partial_spearman_windows(
+            partial,
+            output_path=outputs_dir / "partial_spearman_validation_windows.png",
+        ),
+        "forward_validation_delta": _plot_forward_validation_deltas(
+            forward,
+            output_path=outputs_dir / "forward_draft_class_performance_deltas.png",
+        ),
+        "fsm_sequence": _plot_fsm_sequence(
+            output_path=outputs_dir / "edge_fsm_transition_sequence.png",
+        ),
+    }
+    for name, path in results.items():
+        print(f"{name} visualization saved to: {path}")
+    return results
+
+
 class _VisualizationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.outputs_dir = _outputs_dir()
@@ -882,6 +1330,9 @@ class _VisualizationTest(unittest.TestCase):
             "kinematics_and_cut_efficiency.png",
             "epa_actual_vs_predicted.png",
             "yac_actual_vs_predicted.png",
+            "partial_spearman_validation_windows.png",
+            "forward_draft_class_performance_deltas.png",
+            "edge_fsm_transition_sequence.png",
         ):
             (self.outputs_dir / generated_name).unlink(missing_ok=True)
 
@@ -956,6 +1407,61 @@ class _VisualizationTest(unittest.TestCase):
             )
 
         self.assertEqual(set(generated), {"kinematics", "epa", "yards_after_catch"})
+        for path in generated.values():
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            path.unlink()
+
+    def test_generates_audit_and_illustrative_fsm_figures(self) -> None:
+        partial = pd.DataFrame(
+            {
+                "validation_window": ["pooled", "2024", "2025", "pooled"],
+                "target_metric": ["epa", "epa", "epa", "yac"],
+                "partial_spearman_rho": [0.2, 0.1, -0.1, 0.3],
+                "permutation_p_value": [0.12, 0.42, 0.58, 0.08],
+                "sample_count": [30, 12, 14, 30],
+                "status": ["ok", "ok", "ok", "ok"],
+            }
+        )
+        forward = pd.DataFrame(
+            {
+                "target_metric": ["epa", "epa", "yac", "yac"],
+                "test_draft_year": [2024, 2024, 2025, 2025],
+                "model_variant": [
+                    "base",
+                    "base_plus_metric",
+                    "base",
+                    "base_plus_metric",
+                ],
+                "status": ["ok"] * 4,
+                "rmse": [0.8, 0.7, 4.0, 3.8],
+                "mae": [0.5, 0.4, 2.5, 2.3],
+                "r2": [0.1, 0.2, 0.0, 0.05],
+            }
+        )
+        with patch(
+            f"{__name__}._outputs_dir",
+            return_value=self.outputs_dir.resolve(),
+        ):
+            generated = generate_audit_visualizations(partial, forward)
+
+        self.assertEqual(
+            set(generated),
+            {"partial_spearman", "forward_validation_delta", "fsm_sequence"},
+        )
+        for path in generated.values():
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertGreater(path.stat().st_size, 1_000)
+            path.unlink()
+
+    def test_audit_figures_explain_missing_data(self) -> None:
+        with patch(
+            f"{__name__}._outputs_dir",
+            return_value=self.outputs_dir.resolve(),
+        ):
+            generated = generate_audit_visualizations()
+
         for path in generated.values():
             self.assertTrue(path.is_file())
             self.assertEqual(path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")

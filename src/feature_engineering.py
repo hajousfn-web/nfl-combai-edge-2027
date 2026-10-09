@@ -28,21 +28,55 @@ def _prepare_tracking(tracking_df: pd.DataFrame) -> pd.DataFrame:
     """Validate and sort only the columns needed for kinematic features."""
     if not isinstance(tracking_df, pd.DataFrame):
         raise TypeError("tracking_df must be a pandas DataFrame.")
-
-    missing = sorted(set(REQUIRED_COLUMNS) - set(tracking_df.columns))
-    if missing:
-        raise ValueError(f"tracking_df is missing required columns: {', '.join(missing)}")
     if not tracking_df.columns.is_unique:
         raise ValueError("tracking_df must not contain duplicate column names.")
+
+    source = tracking_df
+    if "entity_type" in source.columns:
+        entity_types = source["entity_type"].astype("string").str.strip().str.upper()
+        if entity_types.isna().any() or entity_types.eq("").any():
+            raise ValueError("entity_type must be present for every tracking row.")
+        source = source.loc[entity_types.eq("PLAYER")].copy()
+        if source.empty:
+            raise ValueError("tracking_df contains no entity_type == 'PLAYER' rows.")
+
+    nfl_id_column = next(
+        (
+            column
+            for column in source.columns
+            if "".join(
+                character for character in str(column).casefold() if character.isalnum()
+            )
+            == "nflid"
+        ),
+        None,
+    )
+    if "player_id" not in source.columns and nfl_id_column is not None:
+        source = source.rename(columns={nfl_id_column: "player_id"})
+    elif "player_id" in source.columns and nfl_id_column is not None:
+        player_ids = source["player_id"].astype("string").str.strip()
+        nfl_ids = source[nfl_id_column].astype("string").str.strip()
+        if not player_ids.eq(nfl_ids).all():
+            raise ValueError("player_id and nfl_id columns disagree.")
+
+    missing = sorted(set(REQUIRED_COLUMNS) - set(source.columns))
+    if missing:
+        raise ValueError(f"tracking_df is missing required columns: {', '.join(missing)}")
 
     # Keep only the inputs needed for these features to limit working memory.
     included_columns = [
         *REQUIRED_COLUMNS,
-        *[column for column in OPTIONAL_SUMMARY_COLUMNS if column in tracking_df.columns],
+        *[column for column in OPTIONAL_SUMMARY_COLUMNS if column in source.columns],
     ]
-    tracks = tracking_df.loc[:, included_columns].copy().reset_index(drop=True)
+    tracks = source.loc[:, included_columns].copy().reset_index(drop=True)
     if tracks.loc[:, TRACK_KEYS].isna().any().any():
         raise ValueError("game_id, play_id, and player_id must not be missing.")
+    for column in TRACK_KEYS:
+        if (
+            pd.api.types.is_object_dtype(tracks[column])
+            or pd.api.types.is_string_dtype(tracks[column])
+        ) and tracks[column].astype("string").str.strip().eq("").any():
+            raise ValueError(f"{column} must not contain blank linkage values.")
 
     for column in ("frame_id", "x", "y"):
         try:
@@ -348,6 +382,27 @@ class _FeatureEngineeringTest(unittest.TestCase):
              "direction_change_degrees", "is_sharp_cut",
              "proprietary_cut_efficiency"}.issubset(result.columns)
         )
+
+    def test_filters_non_player_entities_and_accepts_nfl_id(self) -> None:
+        tracking = pd.DataFrame(
+            [
+                (1, 1, 10, 1, 0.0, 0.0, "PLAYER"),
+                (1, 1, 10, 2, 1.0, 0.0, "PLAYER"),
+                (1, 1, -1, 1, 50.0, 50.0, "BALL"),
+            ],
+            columns=(
+                "game_id",
+                "play_id",
+                "nfl_id",
+                "frame_id",
+                "x",
+                "y",
+                "entity_type",
+            ),
+        )
+        result = run_feature_pipeline(tracking)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result["player_id"].unique().tolist(), [10])
 
     def test_sorts_tracks_and_calculates_sharp_cut_efficiency(self) -> None:
         tracking = pd.DataFrame(

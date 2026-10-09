@@ -14,8 +14,9 @@
 2. [Data Ingestion & Rookie Cohort](#2-data-ingestion--rookie-cohort)
 3. [Micro-Kinematic Feature Engineering](#3-micro-kinematic-feature-engineering)
 4. [Statistical Integration & Baseline](#4-statistical-integration--baseline)
-5. [Visualizations & Strategic Conclusion](#5-visualizations--strategic-conclusion)
-6. [Reproducibility and limitations](#6-reproducibility-and-limitations)
+5. [Edge Risk Evaluation & FSM Telemetry](#5-edge-risk-evaluation--fsm-telemetry)
+6. [Visualizations & Strategic Conclusion](#6-visualizations--strategic-conclusion)
+7. [Reproducibility and limitations](#7-reproducibility-and-limitations)
 
 ## 1. Executive Summary & Sovereign Edge
 
@@ -34,6 +35,10 @@ cohort, data quality, and empirical results have been checked.
 
 ### Sovereign engineering approach
 
+- Bridge raw 10 Hz spatial kinematics and Cut Efficiency (CE) to two clearly
+  separated outcomes: offline statistical evidence for EPA/YAC and a
+  deployment-owned edge risk policy that feeds an industrial-style FSM
+  telemetry contract.
 - Keep the processing, feature engineering, statistical integration, and
   visualization modules separate.
 - Do not fetch competition datasets from this notebook. Configure paths only
@@ -42,6 +47,15 @@ cohort, data quality, and empirical results have been checked.
 - Keep generated reports, plots, and model artifacts in `outputs/`; do not
   commit raw, intermediate, or restricted data.
 - Treat cohort definitions and conclusions as human-reviewed decisions.
+- Keep offline tracking/model analysis separate from any deployment-owned
+  real-time risk policy and its FSM telemetry.
+
+The analytical layer reports nested Ridge cross-validation, forward
+draft-class validation, and partial Spearman/permutation audit results. The
+edge layer does not reuse those fitted scores as a risk controller: a
+separately reviewed deployment policy classifies current observations, and the
+FSM manages state transitions, faults, telemetry, and manual reset. Neither
+the policy thresholds nor actuator behavior are defined here.
 
 **Executive finding:** [Complete after analysis; do not infer from mock tests.]
 
@@ -115,10 +129,17 @@ track and frame before calculating movement. When available, a consistent
 Coordinates are assumed by the implementation to be yards. Confirm that this
 matches the source data before interpreting speeds or decelerations.
 
+These 10 Hz measurements and CE are analytical inputs only. If a deployment
+uses them for edge-risk evaluation, a separately reviewed policy must classify
+the current sample before the finite-state telemetry contract receives it.
+This report does not define operational hazard limits.
+
 ### Engineering decisions to document
 
 - [ ] Confirm that `frame_id` is the correct 10 Hz time index.
 - [ ] Check duplicate frames and missing/interrupted observations.
+- [ ] Filter `entity_type == "PLAYER"` before calculating movement; document
+  whether the source includes non-player/ball entities.
 - [ ] Verify track boundaries (`game_id`, `play_id`, `player_id`) and coordinate
   direction conventions.
 - [ ] Determine whether gaps in frames need a maximum permitted duration.
@@ -128,6 +149,17 @@ matches the source data before interpreting speeds or decelerations.
 **Feature summary:** [Insert validated counts, distributions, and units.]
 
 **Quality checks:** [Insert checks and outcomes.]
+
+### Prelaunch acceleration channel
+
+`statistical_audit.audit_prelaunch_motion()` requires a validated per-track
+`launch_frame_id`. It reports prelaunch frame count, mean speed and
+acceleration, and whether speed exceeded a documented tolerance before the
+event marker. The helper cannot determine the event from coordinates alone.
+Use an event-aligned complete track and predeclare the tolerance; records
+without enough prelaunch samples are marked insufficient, not classified as
+starting from rest. No pre-motion finding is asserted until this audit is run
+on verified competition rows with a valid event marker.
 
 ## 4. Statistical Integration & Baseline
 
@@ -177,13 +209,89 @@ labels. Report eligible sample counts and missingness; a small rookie cohort
 can produce unstable estimates. Neither the descriptive Ridge baseline nor
 cross-validated prediction establishes causality.
 
+### Partial Spearman and permutation audit
+
+`src/statistical_audit.py` rank-transforms Cut Efficiency, target, and available
+controls (average deceleration and max speed), residualizes each ranked signal
+against the controls, and estimates partial Spearman rho from the residual
+correlation. A two-sided residual permutation test reports a `+1`-corrected
+p-value. Rows with missing/non-finite analysis values are excluded listwise.
+This simple permutation design assumes independent, exchangeable rows; player,
+game, or team clustering and repeated-measure dependence must be addressed
+before inferential claims. Report permutation count, control set, eligible
+sample size, and limitations.
+
+### Forward validation across draft classes
+
+`forward_validate_ridge_by_draft_class()` tunes alpha with inner K-fold CV on
+earlier classes only, then evaluates the next available class (for example,
+train 2023 and test 2024; train 2023–2024 and test 2025). The test class is not
+used for imputation, scaling, or tuning. Folds below the configured minimum
+training count are explicitly marked `insufficient_training_data`; do not
+interpret a missing score as a successful validation. Aggregate outputs are
+written to `outputs/partial_spearman_permutation_audit.csv` and
+`outputs/forward_draft_class_validation.csv`.
+
 **Observed relationships:** [Populate only after running on verified data.]
 
 **Alternative explanations and confounders:** [Document.]
 
 **Human review / decision:** [Record what the evidence does and does not support.]
 
-## 5. Visualizations & Strategic Conclusion
+## 5. Edge Risk Evaluation & FSM Telemetry
+
+This is a separate edge-facing state/telemetry contract, not an extension of
+the Ridge model. At each observation, a deployment-owned and safety-reviewed
+policy may evaluate the current 10 Hz speed, acceleration/deceleration,
+direction change, CE, sample freshness, and verified spatial proximity. Its
+ordinary classifications are `SAFE`, `WARNING`, `DANGER`, and
+`EMERGENCY_STOP`; the telemetry FSM additionally records `SENSOR_FAULT` and
+`FAIL_SAFE_LOCKED`. This repository does not infer risk from the statistical
+EPA/YAC model.
+
+`src/zone_loader.py` validates explicit distance enter/clear pairs from a
+caller-supplied JSON configuration. Hysteresis requires ordered thresholds to
+avoid boundary chatter; no field threshold is supplied as an approved default.
+The 1.1 m value shown in isolated mock fixtures is illustrative only.
+`src/safety_kernel.py` combines one supplied LiDAR distance with kinematics and
+emits a classification; `src/safety_engine.py` connects that reference kernel
+to `src/execution_ring.py`, a fixed-capacity numeric FIFO. No hardware bindings,
+physical LiDAR drivers, or certified industrial kernel are present.
+
+`src/edge_safety_fsm.py` records bounded, ordered telemetry:
+
+- Escalation is immediate; downgrade requires a configured count of
+  consecutive lower-risk observations to avoid state flapping.
+- Invalid input requests latched `SENSOR_FAULT`; an explicit internal
+  fail-safe event may latch `FAIL_SAFE_LOCKED`.
+- `EMERGENCY_STOP`, `SENSOR_FAULT`, and `FAIL_SAFE_LOCKED` remain latched even
+  after later safe observations. They cannot clear automatically.
+- Manual reset requires the configured consecutive safe observations, a
+  non-empty operator identity, and explicit `safe_to_reset=True`; each accepted
+  reset is recorded with the operator and timestamp.
+- Timestamps must be timezone-aware and strictly increasing. Event history is
+  bounded in memory; persistence and operational alarm delivery belong to the
+  deployment integration and must be reviewed separately.
+
+The reset records software acknowledgement only; it is not a physical
+lockout/tagout procedure. The modules do not actuate hardware, implement a
+safety PLC, provide a certified stale-data timer, or certify the policy. The
+ring preallocates bounded numeric storage, but Python still allocates objects
+and remains subject to interpreter/OS scheduling and garbage collection.
+`benchmark_processing()` reports observed local timing distributions only;
+there is no hard-real-time or sub-10 ms guarantee, and this code does not
+disable or bypass the garbage collector. Treat these modules as offline
+reference simulation until responsible safety engineers validate thresholds,
+sensor-failure behavior, end-to-end timing, and independent interlocks for a
+specific target deployment.
+
+**Approved risk policy and thresholds:** [Document owner, version, validation
+evidence, and approved operating context. Leave unset until reviewed.]
+
+**FSM configuration and reset authority:** [Document recovery sample counts,
+operator identity source, safe-to-reset evidence, and audit/persistence plan.]
+
+## 6. Visualizations & Strategic Conclusion
 
 `src/visualization.py` uses Matplotlib's non-interactive Agg backend and a
 color-blind-friendly palette. `generate_project_visualizations()` can plot
@@ -200,6 +308,15 @@ separately retained out-of-fold predictions from a reviewed evaluation run.
 The legacy scatter utility remains available for efficiency/performance CSVs
 and the aggregate correlation-vs-Ridge-coefficient plot.
 
+`generate_audit_visualizations()` adds three high-resolution PNGs directly to
+`outputs/`: partial Spearman estimates across pooled/class windows,
+out-of-class Base-vs-Base+CE metric deltas, and an FSM transition-contract
+illustration. The first two are drawn only from actual audit results; absent
+files produce an explicit no-data graphic rather than fabricated values. The
+FSM graphic is explicitly illustrative, not a measured risk sequence. Positive
+RMSE/MAE reductions and R² gains favor Base+CE, but no generalization claim
+should be made from a small or incomplete set of draft classes.
+
 Example after producing an authorized, prepared player-level file:
 
 ```bash
@@ -213,6 +330,12 @@ python -c "from src.visualization import generate_project_visualizations; genera
 3. [Cut efficiency vs. defensive stops, if verified and analyzed.]
 4. [Optional: correlation/Ridge-coefficient overview, clearly labelled as
    descriptive.]
+5. `outputs/partial_spearman_validation_windows.png` — evidence by window or
+   explicit data-availability status.
+6. `outputs/forward_draft_class_performance_deltas.png` — paired forward-test
+   deltas; interpret only valid folds.
+7. `outputs/edge_fsm_transition_sequence.png` — illustrative contract only;
+   not an empirical NFL risk result.
 
 **Scout/coach interpretation:** [Human-authored, tied to observed evidence.]
 
@@ -221,7 +344,7 @@ python -c "from src.visualization import generate_project_visualizations; genera
 Do not present an association as a causal mechanism or scouting rule without
 appropriate validation and domain review.
 
-## 6. Reproducibility and limitations
+## 7. Reproducibility and limitations
 
 Run mock-data validation from the project root:
 
@@ -229,6 +352,7 @@ Run mock-data validation from the project root:
 python src/pipeline.py --self-test
 python src/feature_engineering.py --self-test
 python src/model_integration.py --self-test
+python src/edge_safety_fsm.py
 python src/visualization.py --self-test
 ```
 
@@ -243,11 +367,20 @@ requires rows sorted by game, play, player, and frame.
 
 - [ ] All tables, field names, units, joins, and cohort counts verified.
 - [ ] Rookie-season filtering (`season == draft_year`) independently checked.
+- [ ] Join keys are non-null and the composite game/play/player/frame key is
+  unique; non-player entities are filtered before kinematics.
 - [ ] Outcome aggregation choices documented and reviewed.
+- [ ] Partial Spearman controls, permutation assumptions, and forward test
+  classes/sample sizes reported.
+- [ ] Pre-motion claims are based on a validated launch marker, declared
+  tolerance, and sufficient prelaunch frames; otherwise left unclaimed.
 - [ ] Results generated from authorized data, with no mock values in the report.
 - [ ] Plots include readable labels, sample sizes, and appropriate caveats.
 - [ ] Conclusions are human-reviewed and distinguish association from
   prediction/causation.
+- [ ] Edge-policy thresholds and invalid/stale data handling are approved by
+  the deployment safety owner; the reference FSM is not represented as a
+  certified controller.
 - [ ] Notebook executes in the intended Kaggle environment with no network
   downloads or local-machine path assumptions.
 - [ ] No raw or restricted data is embedded in notebook outputs or committed.

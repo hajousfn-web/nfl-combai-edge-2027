@@ -20,10 +20,11 @@ import numpy as np
 import pandas as pd
 
 if __package__:
-    from . import feature_engineering, model_integration
+    from . import feature_engineering, model_integration, statistical_audit
 else:
     import feature_engineering
     import model_integration
+    import statistical_audit
 
 
 REQUIRED_COLUMNS = ("game_id", "play_id", "player_id", "frame_id", "x", "y")
@@ -47,6 +48,9 @@ class PipelineResult:
 
     player_summary: pd.DataFrame
     model_metrics: pd.DataFrame | None
+    partial_correlations: pd.DataFrame | None = None
+    forward_validation: pd.DataFrame | None = None
+    prelaunch_audit: pd.DataFrame | None = None
 
 
 def _outputs_dir() -> Path:
@@ -80,6 +84,11 @@ def _find_column(frame: pd.DataFrame, candidates: tuple[str, ...]) -> str | None
         if match is not None:
             return match
     return None
+
+
+def _prepare_tracking_entities(tracking: pd.DataFrame) -> pd.DataFrame:
+    """Keep player entities and audit unique per-frame tracking linkage."""
+    return statistical_audit.prepare_tracking_players(tracking)
 
 
 def _load_frame(source: FrameSource, *, name: str, max_rows: int) -> pd.DataFrame:
@@ -133,9 +142,26 @@ def _build_model_input(
         raise ValueError("Performance data must include a player ID and season.")
     if epa_column is None or yac_column is None:
         raise ValueError("Performance data must include numeric EPA and YAC columns.")
+    statistical_audit.validate_player_identifier_consistency(
+        performance,
+        preferred_column=player_column,
+        table_name="Performance data",
+    )
+    statistical_audit.validate_linkage_keys(
+        performance,
+        table_name="Performance data",
+        key_columns=(player_column, season_column),
+        unique=False,
+    )
 
     summary = player_summary.copy()
     summary["_pipeline_join_key"] = summary["player_id"].astype("string").str.strip()
+    if summary["_pipeline_join_key"].isna().any() or summary[
+        "_pipeline_join_key"
+    ].eq("").any():
+        raise ValueError("Tracking summaries contain missing player identifiers.")
+    if summary["_pipeline_join_key"].duplicated().any():
+        raise ValueError("Tracking summaries must contain one row per player.")
     summary["draft_year"] = pd.to_numeric(summary["draft_year"], errors="coerce")
     if summary["draft_year"].isna().any():
         raise ValueError("draft_year must be present and numeric for every player.")
@@ -223,6 +249,7 @@ def run_full_pipeline(
             name="Tracking",
             max_rows=max_tracking_rows,
         )
+        tracking = _prepare_tracking_entities(tracking)
         missing_columns = sorted(
             set(feature_engineering.REQUIRED_COLUMNS) - set(tracking.columns)
         )
@@ -231,6 +258,11 @@ def run_full_pipeline(
                 "Tracking data is missing required columns: "
                 + ", ".join(missing_columns)
             )
+
+        prelaunch_audit: pd.DataFrame | None = None
+        if "launch_frame_id" in tracking.columns:
+            LOGGER.info("Auditing event-anchored prelaunch motion.")
+            prelaunch_audit = statistical_audit.audit_prelaunch_motion(tracking)
 
         LOGGER.info("Extracting 10 Hz kinematics and cut-efficiency summaries.")
         player_summary = feature_engineering.calculate_deceleration_efficiency(
@@ -245,6 +277,8 @@ def run_full_pipeline(
             performance_source = performance_data
 
         model_metrics: pd.DataFrame | None = None
+        partial_correlations: pd.DataFrame | None = None
+        forward_validation: pd.DataFrame | None = None
         if performance_source is None:
             LOGGER.warning(
                 "No performance outcomes supplied; returning feature summaries "
@@ -260,15 +294,27 @@ def run_full_pipeline(
             model_input = _build_model_input(player_summary, performance)
             LOGGER.info("Running nested-CV Ridge baselines for EPA and YAC.")
             model_metrics = model_integration.run_model_pipeline(model_input)
+            LOGGER.info(
+                "Running partial Spearman permutation audits and forward "
+                "draft-class validation."
+            )
+            audit_result = statistical_audit.run_statistical_audit(model_input)
+            partial_correlations = audit_result.partial_correlations
+            forward_validation = audit_result.forward_validation
 
         LOGGER.info(
-            "Pipeline completed: %s player summaries; model metrics %s.",
+            "Pipeline completed: %s player summaries; model metrics %s; "
+            "statistical audit %s.",
             f"{len(player_summary):,}",
             "available" if model_metrics is not None else "not requested",
+            "available" if partial_correlations is not None else "not requested",
         )
         return PipelineResult(
             player_summary=player_summary,
             model_metrics=model_metrics,
+            partial_correlations=partial_correlations,
+            forward_validation=forward_validation,
+            prelaunch_audit=prelaunch_audit,
         )
     except (OSError, TypeError, ValueError) as error:
         LOGGER.error("Full pipeline failed: %s", error)
@@ -276,7 +322,7 @@ def run_full_pipeline(
 
 
 def process_tracking(input_file: TextIO, output_file: IO[str]) -> int:
-    """Write tracking rows with movement metrics; return the number of rows."""
+    """Write PLAYER rows with movement metrics; return the number written."""
     reader = csv.DictReader(input_file)
     if reader.fieldnames is None:
         raise ValueError("Input CSV is empty or has no header.")
@@ -284,9 +330,25 @@ def process_tracking(input_file: TextIO, output_file: IO[str]) -> int:
     fieldnames = [name.strip() for name in reader.fieldnames]
     if len(set(fieldnames)) != len(fieldnames):
         raise ValueError("Input CSV contains duplicate column names after trimming.")
-    missing = sorted(set(REQUIRED_COLUMNS) - set(fieldnames))
+    normalized_fields = {
+        _normalized_column_name(name): name for name in fieldnames
+    }
+    player_field = next(
+        (
+            normalized_fields[_normalized_column_name(candidate)]
+            for candidate in ("player_id", "nfl_id", "player_id")
+            if _normalized_column_name(candidate) in normalized_fields
+        ),
+        None,
+    )
+    missing: list[str] = sorted(
+        (set(REQUIRED_COLUMNS) - {"player_id"}) - set(fieldnames)
+    )
     if missing:
         raise ValueError(f"Input CSV is missing required columns: {', '.join(missing)}")
+    if player_field is None:
+        raise ValueError("Input CSV requires a player_id or nfl_id column.")
+    entity_field = normalized_fields.get("entitytype")
     conflicting = sorted(set(OUTPUT_COLUMNS) & set(fieldnames))
     if conflicting:
         raise ValueError(
@@ -300,12 +362,26 @@ def process_tracking(input_file: TextIO, output_file: IO[str]) -> int:
     current_track: tuple[str, str, str] | None = None
     previous: tuple[int, float, float] | None = None
     row_count = 0
+    written_count = 0
     for row_count, row in enumerate(reader, start=1):
+        if entity_field is not None:
+            entity_type = (row.get(entity_field) or "").strip().upper()
+            if not entity_type:
+                raise ValueError(
+                    f"Input row {row_count} has a missing entity_type linkage label."
+                )
+            if entity_type != "PLAYER":
+                continue
         try:
-            track = (row["game_id"], row["play_id"], row["player_id"])
+            track = tuple(
+                row[column].strip()
+                for column in ("game_id", "play_id", player_field)
+            )
             frame = int(row["frame_id"])
             x = float(row["x"])
             y = float(row["y"])
+            if not all(track):
+                raise ValueError("game_id, play_id, and player identifier must be non-empty")
             if not math.isfinite(x) or not math.isfinite(y):
                 raise ValueError("coordinates must be finite numbers")
         except (KeyError, TypeError, ValueError) as error:
@@ -341,9 +417,10 @@ def process_tracking(input_file: TextIO, output_file: IO[str]) -> int:
             speed_10hz=speed,
         )
         writer.writerow(row)
+        written_count += 1
         previous = (frame, x, y)
 
-    return row_count
+    return written_count
 
 
 def main() -> int:
@@ -457,6 +534,18 @@ class _PipelineTest(unittest.TestCase):
         self.assertIn("speed_10hz", output_file.getvalue().splitlines()[0])
         self.assertTrue(output_file.getvalue().splitlines()[2].endswith("50.0"))
 
+    def test_streaming_mode_filters_non_player_entities(self) -> None:
+        input_file = StringIO(
+            "game_id,play_id,nfl_id,frame_id,x,y,entity_type\n"
+            "1,2,3,1,0,0,PLAYER\n"
+            "1,2,,1,0,0,BALL\n"
+            "1,2,3,2,1,0,PLAYER\n"
+        )
+        output_file = StringIO()
+        self.assertEqual(process_tracking(input_file, output_file), 2)
+        self.assertEqual(len(output_file.getvalue().splitlines()), 3)
+        self.assertTrue(output_file.getvalue().splitlines()[2].endswith("10.0"))
+
     def test_rejects_decreasing_track_order(self) -> None:
         input_file = StringIO(
             "game_id,play_id,player_id,frame_id,x,y\n"
@@ -522,7 +611,7 @@ class _FullPipelineTest(unittest.TestCase):
             model_integration,
             "MODEL_PIPELINE_OUTPUT_FILENAME",
             self.metrics_path.name,
-        ):
+        ), patch.object(statistical_audit, "_save_csv_atomic", return_value=Path("mock")):
             result = run_full_pipeline(tracking, performance)
 
         self.assertEqual(len(result.player_summary), 12)
@@ -532,6 +621,10 @@ class _FullPipelineTest(unittest.TestCase):
             set(result.model_metrics["target_metric"]),
             {"epa", "yards_after_catch"},
         )
+        self.assertIsNotNone(result.partial_correlations)
+        self.assertIsNotNone(result.forward_validation)
+        assert result.forward_validation is not None
+        self.assertIn(2025, result.forward_validation["test_draft_year"].tolist())
         self.assertTrue(self.metrics_path.is_file())
 
     def test_feature_only_run_does_not_require_outcomes(self) -> None:
@@ -554,6 +647,25 @@ class _FullPipelineTest(unittest.TestCase):
         tracking, _ = self._mock_inputs()
         with self.assertRaisesRegex(ValueError, "memory bound"):
             run_full_pipeline(tracking, max_tracking_rows=10)
+
+    def test_filters_non_player_entities_and_normalizes_nfl_id(self) -> None:
+        tracking, _ = self._mock_inputs()
+        tracking.rename(columns={"player_id": "nfl_id"}, inplace=True)
+        ball = tracking.iloc[[0]].copy()
+        ball["nfl_id"] = -1
+        tracking["entity_type"] = "PLAYER"
+        ball["entity_type"] = "BALL"
+        combined = pd.concat([tracking, ball], ignore_index=True)
+        prepared = _prepare_tracking_entities(combined)
+        self.assertEqual(len(prepared), len(tracking))
+        self.assertIn("player_id", prepared.columns)
+        self.assertTrue(prepared["entity_type"].eq("PLAYER").all())
+
+    def test_rejects_duplicate_tracking_linkage_key(self) -> None:
+        tracking, _ = self._mock_inputs()
+        duplicated = pd.concat([tracking, tracking.iloc[[0]]], ignore_index=True)
+        with self.assertRaisesRegex(ValueError, "duplicate linkage"):
+            run_full_pipeline(duplicated)
 
 
 if __name__ == "__main__":
