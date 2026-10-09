@@ -25,8 +25,9 @@ baseline are not evidence of causality or out-of-sample predictive value.
 - `data/` — local input samples and datasets; data files are excluded from Git.
 - `src/pipeline.py` — streaming CSV preparation and 10 Hz displacement-speed
   derivation.
-- `src/feature_engineering.py` — per-player deceleration, speed, and
-  sharp-cut-efficiency summaries; preserves validated `draft_year` when present.
+- `src/feature_engineering.py` — smoothed 10 Hz velocity/acceleration and
+  sharp-cut speed-retention features; preserves validated `draft_year` when
+  present.
 - `src/model_integration.py` — player-level combine/season left join,
   correlation and Ridge-baseline report.
 - `src/visualization.py` — bounded-memory, headless PNG plots from local
