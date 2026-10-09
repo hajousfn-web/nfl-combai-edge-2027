@@ -17,8 +17,12 @@ clear visual evidence over complexity for its own sake.
 - `data/` — local input samples and datasets; data files are excluded from Git.
 - `src/pipeline.py` — streaming CSV preparation and 10 Hz displacement-speed
   derivation.
+- `src/feature_engineering.py` — per-player deceleration, speed, and
+  sharp-cut-efficiency summaries.
+- `src/model_integration.py` — player-level combine/season left join,
+  correlation and Ridge-baseline report.
 - `notebooks/` — exported Kaggle notebooks and exploratory analysis.
-- `outputs/` — charts and final report assets.
+- `outputs/` — local charts, reports, and model artifacts (excluded from Git).
 
 ## Quick start
 
@@ -38,6 +42,22 @@ each game/play/player track.
 
 Place only data you are permitted to use in `data/`; large or competition-
 restricted datasets should remain local and must not be committed.
+
+## Combine/season integration
+
+Call `integrate_combine_with_season_performance(player_summary_df,
+regular_season_df)` from `src/model_integration.py` with a player identifier
+(`nflId` preferred, or a player ID fallback) and the cut-efficiency feature.
+The function preserves combine-summary players in a left join, imputes missing
+cut-efficiency values with the median, and compares the feature with numeric
+season outcomes such as yards after catch and defensive stops. It prints a
+correlation and standardized Ridge-baseline report and writes aggregate-only
+insights to `outputs/model_integration_insights.csv`; it does not export
+player-level records.
+
+Generated output files and model artifacts are intentionally kept local and
+excluded from Git. The `outputs/` directory is preserved by a placeholder file;
+publish selected final assets separately only when they are safe to share.
 
 ## Roadmap
 

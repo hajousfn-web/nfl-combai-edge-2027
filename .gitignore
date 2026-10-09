@@ -20,6 +20,16 @@ env/
 *.arrow
 *.pkl
 *.pickle
+*.joblib
+*.model
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+*.hdf5
+*.tflite
 
 # Generated/cache files
 .pytest_cache/
@@ -29,6 +39,10 @@ env/
 htmlcov/
 build/
 dist/
+
+# Generated outputs stay local; keep only the empty directory placeholder.
+outputs/*
+!outputs/.gitkeep
 
 # OS/editor
 .DS_Store
