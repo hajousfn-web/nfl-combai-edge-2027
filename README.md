@@ -28,8 +28,8 @@ baseline are not evidence of causality or out-of-sample predictive value.
 - `src/feature_engineering.py` — smoothed 10 Hz velocity/acceleration and
   sharp-cut speed-retention features; preserves validated `draft_year` when
   present.
-- `src/model_integration.py` — player-level combine/season left join,
-  correlation and Ridge-baseline report.
+- `src/model_integration.py` — player-level combine/season integration,
+  descriptive associations, and nested-cross-validated Ridge baselines.
 - `src/visualization.py` — bounded-memory, headless PNG plots from local
   processed-metric or aggregate-insight CSVs.
 - `notebooks/` — [Kaggle report skeleton](notebooks/kaggle_report_skeleton.md)
@@ -84,6 +84,29 @@ and standardized Ridge-baseline report and writes aggregate-only insights to
 records. Keep cohort and field definitions human-reviewed; the statistical
 summary is descriptive and does not establish causality or generalizable
 prediction.
+
+## Predictive baseline
+
+`run_model_pipeline(features_df)` evaluates EPA and YAC using a scaled Ridge
+regression pipeline with median imputation. The input must already be a
+player-season table with exactly one row per player and rookie season, a player
+identifier, `draft_year`, `season`, numeric movement features, and numeric EPA
+and YAC columns (for example, `epa` and `yards_after_catch`). It retains only
+the 2023–2025 draft cohorts where `season == draft_year`; repeated player-play
+rows are rejected rather than aggregated with an assumed outcome definition.
+
+Regularized-model tuning occurs inside nested shuffled K-fold validation, and
+reported RMSE, MAE, and R² are computed from outer-fold predictions. Identifier,
+cohort, coordinate, and recognized outcome columns are not used as predictors;
+missing feature values are imputed within each training fold. At least six
+valid player-season labels per outcome are required. The final full-data alpha
+search is reported for reproducibility, but fitted estimators and player-level
+predictions are not persisted. Aggregate results are atomically written to
+`outputs/model_pipeline_metrics.csv`. Run
+`python src/model_integration.py --self-test` to validate both integration and
+the mock-data nested-CV path without reading competition data.
+Cross-validation metrics are not evidence of causality and should be
+interpreted cautiously when the eligible rookie sample is small.
 
 Generated output files and model artifacts are intentionally kept local and
 excluded from Git. The `outputs/` directory is preserved by a placeholder file;

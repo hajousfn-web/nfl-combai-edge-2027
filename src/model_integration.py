@@ -14,6 +14,12 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import GridSearchCV, KFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 PLAYER_KEY_CANDIDATES = (
@@ -28,7 +34,11 @@ CUT_EFFICIENCY_CANDIDATES = (
 )
 RIDGE_ALPHA = 1.0
 OUTPUT_FILENAME = "model_integration_insights.csv"
+MODEL_PIPELINE_OUTPUT_FILENAME = "model_pipeline_metrics.csv"
 ROOKIE_DRAFT_YEARS = (2023, 2024, 2025)
+RIDGE_ALPHA_GRID = (0.01, 0.1, 1.0, 10.0, 100.0)
+MIN_CV_SAMPLES = 6
+RANDOM_STATE = 2027
 
 
 def _normalized_name(name: Any) -> str:
@@ -59,10 +69,107 @@ def _is_target_metric(column: Any) -> bool:
 def _is_context_column(column: Any) -> bool:
     normalized = _normalized_name(column)
     return (
-        normalized in {"season", "draftyear", "rookieyear", "week", "gameid", "playid"}
+        normalized
+        in {
+            "season",
+            "draftyear",
+            "rookieyear",
+            "week",
+            "gameid",
+            "playid",
+            "frame",
+            "frameid",
+            "x",
+            "y",
+            "player",
+            "playeridentifier",
+        }
         or normalized.endswith("playerid")
         or normalized.endswith("nflid")
     )
+
+
+def _target_columns(frame: pd.DataFrame) -> dict[str, str]:
+    """Find the supported outcome columns by normalized schema name."""
+    targets: dict[str, str] = {}
+    for column in frame.columns:
+        normalized = _normalized_name(column)
+        if normalized == "epa" or "expectedpointsadded" in normalized:
+            targets.setdefault("epa", column)
+        elif (
+            normalized in {"yac", "yardsaftercatch"}
+            or "yardsaftercatch" in normalized
+        ):
+            targets.setdefault("yards_after_catch", column)
+    return targets
+
+
+def _model_pipeline() -> Pipeline:
+    """Create an impute-scale-Ridge pipeline fitted independently per fold."""
+    return Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("regressor", Ridge()),
+        ]
+    )
+
+
+def _tune_ridge(
+    features: pd.DataFrame,
+    target: pd.Series,
+    *,
+    folds: int,
+) -> GridSearchCV:
+    """Tune Ridge regularization with shuffled, reproducible K-fold CV."""
+    cross_validator = KFold(
+        n_splits=folds,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+    search = GridSearchCV(
+        estimator=_model_pipeline(),
+        param_grid={"regressor__alpha": RIDGE_ALPHA_GRID},
+        scoring="neg_root_mean_squared_error",
+        cv=cross_validator,
+        n_jobs=1,
+        refit=True,
+        error_score="raise",
+    )
+    search.fit(features, target)
+    return search
+
+
+def _save_model_metrics(metrics: pd.DataFrame) -> Path:
+    """Atomically save aggregate evaluation metrics inside outputs/ only."""
+    project_root = Path(__file__).resolve().parent.parent
+    output_dir = project_root / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_root = project_root.resolve()
+    resolved_output_dir = output_dir.resolve()
+    if resolved_output_dir != resolved_root / "outputs":
+        raise ValueError("The outputs directory must not resolve outside the project.")
+
+    output_path = resolved_output_dir / MODEL_PIPELINE_OUTPUT_FILENAME
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            suffix=".tmp",
+            prefix=".model-metrics-",
+            dir=resolved_output_dir,
+            delete=False,
+        ) as output_file:
+            temp_path = Path(output_file.name)
+            metrics.to_csv(output_file, index=False, na_rep="")
+        os.replace(temp_path, output_path)
+    except OSError as error:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise OSError(f"Could not securely write model metrics: {error}") from error
+    return output_path
 
 
 def _safe_player_key(values: pd.Series) -> pd.Series:
@@ -460,6 +567,167 @@ def integrate_combine_with_season_performance(
     return merged
 
 
+def run_model_pipeline(features_df: pd.DataFrame) -> pd.DataFrame:
+    """Cross-validate Ridge baselines for rookie-season EPA and YAC.
+
+    ``features_df`` must contain one aggregated player-season row per player,
+    with player ID, ``draft_year``, ``season``, numeric movement features, and
+    EPA/YAC outcome columns. Outcomes must already be aggregated to this same
+    unit; this function deliberately does not guess how play-level labels
+    should be combined. Only 2023–2025 rookie-season rows are modeled.
+
+    Nested cross-validation tunes Ridge regularization inside each training
+    fold and reports out-of-fold RMSE, MAE, and R². No player records or model
+    artifacts are persisted; only the aggregate metrics are written to
+    ``outputs/model_pipeline_metrics.csv``.
+    """
+    if not isinstance(features_df, pd.DataFrame) or features_df.empty:
+        raise ValueError("features_df must be a non-empty pandas DataFrame.")
+
+    id_column = _find_column(features_df, PLAYER_KEY_CANDIDATES)
+    draft_year_column = _find_column(features_df, ("draft_year",))
+    season_column = _find_column(features_df, ("season",))
+    if id_column is None:
+        raise ValueError("features_df must include a player identifier.")
+    if draft_year_column is None or season_column is None:
+        raise ValueError("features_df must include draft_year and season columns.")
+
+    target_columns = _target_columns(features_df)
+    if set(target_columns) != {"epa", "yards_after_catch"}:
+        raise ValueError(
+            "features_df must include numeric EPA and YAC outcome columns "
+            "(for example, epa and yards_after_catch)."
+        )
+
+    selected = features_df.copy(deep=False)
+    draft_years = pd.to_numeric(selected[draft_year_column], errors="coerce")
+    seasons = pd.to_numeric(selected[season_column], errors="coerce")
+    player_keys = _safe_player_key(selected[id_column])
+    rookie_mask = (
+        draft_years.isin(ROOKIE_DRAFT_YEARS)
+        & seasons.eq(draft_years)
+        & player_keys.notna()
+    )
+    selected = selected.loc[rookie_mask].copy()
+    selected["_model_player_key"] = player_keys.loc[rookie_mask]
+    if selected.empty:
+        raise ValueError(
+            "No identified player rows match draft_year 2023–2025 and "
+            "season == draft_year."
+        )
+
+    duplicate_rows = selected["_model_player_key"].duplicated(keep=False)
+    if duplicate_rows.any():
+        raise ValueError(
+            "features_df must have one aggregated row per player in the rookie "
+            "season; aggregate play-level rows using domain-reviewed rules first."
+        )
+
+    excluded_columns = {
+        id_column,
+        draft_year_column,
+        season_column,
+        *target_columns.values(),
+    }
+    feature_columns = [
+        column
+        for column in selected.select_dtypes(include=[np.number]).columns
+        if column not in excluded_columns
+        and not _is_context_column(column)
+        and not _is_target_metric(column)
+    ]
+    if not feature_columns:
+        raise ValueError("No numeric movement features are available for modeling.")
+
+    results: list[dict[str, Any]] = []
+    for target_name in ("epa", "yards_after_catch"):
+        target_column = target_columns[target_name]
+        target_values = pd.to_numeric(
+            selected[target_column],
+            errors="coerce",
+        ).replace([np.inf, -np.inf], np.nan)
+        target_mask = target_values.notna()
+        target_rows = selected.loc[target_mask]
+        target_values = target_values.loc[target_mask].astype(float)
+        if len(target_values) < MIN_CV_SAMPLES:
+            raise ValueError(
+                f"{target_name} has {len(target_values)} valid rookie samples; "
+                f"at least {MIN_CV_SAMPLES} are required for nested CV."
+            )
+
+        model_features = target_rows[feature_columns].apply(
+            pd.to_numeric,
+            errors="coerce",
+        )
+        model_features = model_features.replace([np.inf, -np.inf], np.nan)
+        model_features = model_features.dropna(axis=1, how="all")
+        if model_features.empty or model_features.shape[1] == 0:
+            raise ValueError(
+                f"No non-empty numeric movement features are available for {target_name}."
+            )
+
+        row_count = len(target_values)
+        outer_folds = min(5, row_count // 2)
+        outer_cv = KFold(
+            n_splits=outer_folds,
+            shuffle=True,
+            random_state=RANDOM_STATE,
+        )
+        actuals = target_values.to_numpy()
+        predictions = np.full(row_count, np.nan, dtype=float)
+        selected_alphas: list[float] = []
+        for train_indices, test_indices in outer_cv.split(model_features):
+            inner_folds = min(5, len(train_indices) // 2)
+            search = _tune_ridge(
+                model_features.iloc[train_indices],
+                target_values.iloc[train_indices],
+                folds=inner_folds,
+            )
+            predictions[test_indices] = search.predict(
+                model_features.iloc[test_indices]
+            )
+            selected_alphas.append(float(search.best_params_["regressor__alpha"]))
+
+        full_data_inner_folds = min(5, row_count // 2)
+        final_search = _tune_ridge(
+            model_features,
+            target_values,
+            folds=full_data_inner_folds,
+        )
+        has_target_variation = np.ptp(actuals) > 0
+        results.append(
+            {
+                "target_metric": target_name,
+                "player_season_count": row_count,
+                "feature_count": model_features.shape[1],
+                "outer_cv_folds": outer_folds,
+                "inner_cv_folds": full_data_inner_folds,
+                "selected_alpha_median": float(np.median(selected_alphas)),
+                "full_data_best_alpha": float(
+                    final_search.best_params_["regressor__alpha"]
+                ),
+                "cv_rmse": float(np.sqrt(mean_squared_error(actuals, predictions))),
+                "cv_mae": float(mean_absolute_error(actuals, predictions)),
+                "cv_r2": (
+                    float(r2_score(actuals, predictions))
+                    if has_target_variation
+                    else np.nan
+                ),
+            }
+        )
+
+    metrics = pd.DataFrame(results)
+    output_path = _save_model_metrics(metrics)
+    print("Rookie-season movement features: nested Ridge cross-validation")
+    print(
+        "Cohort: draft_year in "
+        f"{ROOKIE_DRAFT_YEARS}; rookie season equals draft_year"
+    )
+    print(metrics.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
+    print(f"Aggregate cross-validation metrics saved to: {output_path}")
+    return metrics
+
+
 class _ModelIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.output_path = (
@@ -539,6 +807,54 @@ class _ModelIntegrationTest(unittest.TestCase):
         self.assertTrue(_is_target_metric("epa"))
         self.assertTrue(_is_target_metric("expected_points_added"))
 
+    def test_run_model_pipeline_nested_cv_with_mock_player_seasons(self) -> None:
+        player_count = 12
+        movement = np.linspace(0.2, 1.3, player_count)
+        mock_features = pd.DataFrame(
+            {
+                "nflId": np.arange(1001, 1001 + player_count),
+                "draft_year": [2023, 2024, 2025] * 4,
+                "season": [2023, 2024, 2025] * 4,
+                "average_proprietary_cut_efficiency": movement,
+                "average_deceleration": np.linspace(0.5, 4.0, player_count),
+                "max_speed": np.linspace(15.0, 22.0, player_count),
+                "epa": 0.4 * movement + np.linspace(-0.2, 0.2, player_count),
+                "yards_after_catch": 8.0 * movement + np.linspace(-1.0, 1.0, player_count),
+                "defensive_stops": np.arange(player_count, dtype=float),
+            }
+        )
+        mock_features.loc[3, "max_speed"] = np.nan
+
+        with patch(
+            f"{__name__}.MODEL_PIPELINE_OUTPUT_FILENAME",
+            self.output_path.name,
+        ):
+            metrics = run_model_pipeline(mock_features)
+
+        self.assertEqual(set(metrics["target_metric"]), {"epa", "yards_after_catch"})
+        self.assertTrue(metrics["cv_rmse"].notna().all())
+        self.assertTrue(metrics["cv_mae"].notna().all())
+        self.assertTrue(metrics["cv_r2"].notna().all())
+        self.assertTrue((metrics["player_season_count"] == player_count).all())
+        self.assertTrue((metrics["feature_count"] == 3).all())
+        self.assertTrue(self.output_path.is_file())
+        saved = pd.read_csv(self.output_path)
+        self.assertEqual(len(saved), 2)
+
+    def test_run_model_pipeline_rejects_unaggregated_player_rows(self) -> None:
+        repeated_rows = pd.DataFrame(
+            {
+                "player_id": [1, 1],
+                "draft_year": [2024, 2024],
+                "season": [2024, 2024],
+                "speed": [10.0, 11.0],
+                "epa": [0.2, 0.3],
+                "yac": [4.0, 5.0],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "one aggregated row per player"):
+            run_model_pipeline(repeated_rows)
+
     def test_requires_player_identifiers(self) -> None:
         with self.assertRaisesRegex(ValueError, "player identifier"):
             with patch(f"{__name__}.OUTPUT_FILENAME", self.output_path.name):
@@ -551,7 +867,10 @@ class _ModelIntegrationTest(unittest.TestCase):
 def main() -> int:
     """Run mock-data validation without reading competition datasets."""
     parser = argparse.ArgumentParser(
-        description="Validate player-level combine/season integration."
+        description=(
+            "Validate player-level combine/season integration and the "
+            "nested-CV Ridge baseline."
+        )
     )
     parser.add_argument(
         "--self-test",

@@ -161,12 +161,21 @@ mistaken for a domain-validated outcome definition.
 | EPA | [ ] | [ ] | [ ] | [ ] | [ ] |
 | Defensive stops | [ ] | [ ] | [ ] | [ ] | [ ] |
 
-The current implementation computes a one-feature standardized Ridge baseline
-with `alpha=1` and reports in-sample R². This is a descriptive baseline, **not
-validated predictive performance**. It does not establish causality or prove
-that the metric generalizes. Report sample size, missingness, confidence/
-validation approach, and any multiple-comparison considerations alongside
-associations.
+The integration function's one-feature standardized Ridge baseline is
+descriptive and reports in-sample R². For a predictive baseline, the module
+also exposes `run_model_pipeline(features_df)`, which expects one already
+aggregated row per player-season, with numeric movement features, player ID,
+`draft_year`, `season`, and both EPA and YAC labels. It rejects repeated
+player-season rows rather than guessing how play outcomes should aggregate.
+For each target, the function uses median imputation and scaling inside a Ridge
+pipeline; inner K-fold CV tunes regularization and outer-fold predictions
+provide RMSE, MAE, and R². It saves aggregate-only metrics to
+`outputs/model_pipeline_metrics.csv`, not player records or model artifacts.
+
+Populate the validation design and metrics only after running against verified
+labels. Report eligible sample counts and missingness; a small rookie cohort
+can produce unstable estimates. Neither the descriptive Ridge baseline nor
+cross-validated prediction establishes causality.
 
 **Observed relationships:** [Populate only after running on verified data.]
 
