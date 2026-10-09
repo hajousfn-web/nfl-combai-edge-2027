@@ -31,7 +31,8 @@ baseline are not evidence of causality or out-of-sample predictive value.
   correlation and Ridge-baseline report.
 - `src/visualization.py` — bounded-memory, headless PNG plots from local
   processed-metric or aggregate-insight CSVs.
-- `notebooks/` — exported Kaggle notebooks and exploratory analysis.
+- `notebooks/` — [Kaggle report skeleton](notebooks/kaggle_report_skeleton.md)
+  and exported notebooks.
 - `outputs/` — local charts, reports, and model artifacts (excluded from Git).
 
 ## Quick start
